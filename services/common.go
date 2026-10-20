@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	coinwerr "github.com/tigusigalpa/coinw-go/errors"
+	"github.com/tigusigalpa/coinw-go/model"
 	"github.com/tigusigalpa/coinw-go/transport"
 )
 
@@ -21,34 +22,34 @@ func NewAccountService(ex *transport.Executor) *AccountService {
 }
 
 // GetDepositWithdrawalAddress — command=returnDepositAddresses.
-// symbolID is the currency id (e.g. "USDT"); chain="" omits.
-func (s *AccountService) GetDepositWithdrawalAddress(ctx context.Context, symbolID, chain string) (*transport.Result, error) {
+// symbolID is the published currency identifier; chain is required by its table.
+func (s *AccountService) GetDepositWithdrawalAddress(ctx context.Context, symbolID, chain string) (*transport.Response[[]model.DepositAddress], error) {
 	if _, err := requireNonEmpty(symbolID, "symbolId"); err != nil {
 		return nil, err
 	}
-	return s.call(ctx, "common.account.getDepositWithdrawalAddress", nonNull(map[string]interface{}{
+	return callTyped[[]model.DepositAddress](s.base, ctx, "common.account.getDepositWithdrawalAddress", nonNull(map[string]interface{}{
 		"symbolId": symbolID,
 		"chain":    emptyToNil(chain),
 	}))
 }
 
 // GetDepositWithdrawalHistory — command=returnDepositsWithdrawals.
-// symbol="" lists all currencies.
-func (s *AccountService) GetDepositWithdrawalHistory(ctx context.Context, symbol string) (*transport.Result, error) {
-	return s.call(ctx, "common.account.getDepositWithdrawalHistory", nonNull(map[string]interface{}{
+// symbol is required by the table; up to 20 comma-separated currencies.
+func (s *AccountService) GetDepositWithdrawalHistory(ctx context.Context, symbol string) (*transport.Response[[]model.DepositWithdrawal], error) {
+	return callTyped[[]model.DepositWithdrawal](s.base, ctx, "common.account.getDepositWithdrawalHistory", nonNull(map[string]interface{}{
 		"symbol": emptyToNil(symbol),
 	}))
 }
 
 // WithdrawalRequest — documented doWithdraw fields.
 type WithdrawalRequest struct {
-	Amount      string // decimal string — required
-	Currency    string // e.g. "HC" — required
-	Address     string // destination — required
-	Type        string // e.g. "internal_transfer" — "" omits
-	Memo        string // "" omits
-	InnerToType int    // <=0 omits
-	Extra       map[string]interface{}
+	Amount      model.Decimal // decimal string — required
+	Currency    string        // e.g. "HC" — required
+	Address     string        // destination — required
+	Chain       string        // documented blockchain name — required
+	Type        string        // e.g. "internal_transfer" — "" omits
+	Memo        string        // "" omits
+	InnerToType int           // <=0 omits
 }
 
 // InitiateWithdrawal — command=doWithdraw. HIGH-RISK MUTATION.
@@ -56,8 +57,8 @@ type WithdrawalRequest struct {
 // Funds leave the account. The SDK never calls this implicitly and never
 // retries it. memo/address-type fields are passed exactly as given — the
 // documentation does not define their value space.
-func (s *AccountService) InitiateWithdrawal(ctx context.Context, r WithdrawalRequest) (*transport.Result, error) {
-	if _, err := decimalArg(r.Amount, "amount"); err != nil {
+func (s *AccountService) InitiateWithdrawal(ctx context.Context, r WithdrawalRequest) (*transport.Response[model.WithdrawalAcknowledgement], error) {
+	if _, err := decimalArg(string(r.Amount), "amount"); err != nil {
 		return nil, err
 	}
 	if _, err := requireNonEmpty(r.Currency, "currency"); err != nil {
@@ -67,9 +68,12 @@ func (s *AccountService) InitiateWithdrawal(ctx context.Context, r WithdrawalReq
 		return nil, err
 	}
 	params := map[string]interface{}{
-		"amount":   r.Amount,
-		"currency": r.Currency,
-		"address":  r.Address,
+		"amount":      string(r.Amount),
+		"currency":    r.Currency,
+		"address":     r.Address,
+		"chain":       r.Chain,
+		"memo":        r.Memo,
+		"innerToType": r.InnerToType,
 	}
 	if r.Type != "" {
 		params["type"] = r.Type
@@ -80,24 +84,21 @@ func (s *AccountService) InitiateWithdrawal(ctx context.Context, r WithdrawalReq
 	if r.InnerToType > 0 {
 		params["innerToType"] = r.InnerToType
 	}
-	for k, v := range r.Extra {
-		params[k] = v
-	}
-	return s.call(ctx, "common.account.initiateWithdrawal", params)
+	return callTyped[model.WithdrawalAcknowledgement](s.base, ctx, "common.account.initiateWithdrawal", params)
 }
 
 // CancelWithdrawal — command=cancelWithdraw. MUTATION.
-func (s *AccountService) CancelWithdrawal(ctx context.Context, id string) (*transport.Result, error) {
+func (s *AccountService) CancelWithdrawal(ctx context.Context, id string) (*transport.Response[model.NoData], error) {
 	if _, err := requireNonEmpty(id, "id"); err != nil {
 		return nil, err
 	}
-	return s.call(ctx, "common.account.cancelWithdrawal", map[string]interface{}{"id": id})
+	return callTyped[model.NoData](s.base, ctx, "common.account.cancelWithdrawal", map[string]interface{}{"id": id})
 }
 
 // TransferAssets — command=spotWealthTransfer. MUTATION.
 // amount is a decimal string; the other fields are the documented
 // account/biz codes (e.g. "SPOT", "WEALTH", "SPOT_TO_WEALTH", "BTC").
-func (s *AccountService) TransferAssets(ctx context.Context, accountType, targetAccountType, bizType, coinCode, amount string) (*transport.Result, error) {
+func (s *AccountService) TransferAssets(ctx context.Context, accountType, targetAccountType, bizType, coinCode, amount string) (*transport.Response[bool], error) {
 	for name, v := range map[string]string{
 		"accountType": accountType, "targetAccountType": targetAccountType,
 		"bizType": bizType, "coinCode": coinCode,
@@ -109,7 +110,7 @@ func (s *AccountService) TransferAssets(ctx context.Context, accountType, target
 	if _, err := decimalArg(amount, "amount"); err != nil {
 		return nil, err
 	}
-	return s.call(ctx, "common.account.transferAssets", map[string]interface{}{
+	return callTyped[bool](s.base, ctx, "common.account.transferAssets", map[string]interface{}{
 		"accountType":       accountType,
 		"targetAccountType": targetAccountType,
 		"bizType":           bizType,
@@ -142,21 +143,21 @@ func NewSubAccountService(ex *transport.Executor) *SubAccountService {
 }
 
 // GetSubAccountList — command=subAccount_list.
-func (s *SubAccountService) GetSubAccountList(ctx context.Context) (*transport.Result, error) {
-	return s.call(ctx, "common.subAccount.getSubAccountList", nil)
+func (s *SubAccountService) GetSubAccountList(ctx context.Context) (*transport.Response[[]model.SubAccount], error) {
+	return callTyped[[]model.SubAccount](s.base, ctx, "common.subAccount.getSubAccountList", nil)
 }
 
 // GetSubAccountApiKeys — command=subAccount_apikey.
-func (s *SubAccountService) GetSubAccountApiKeys(ctx context.Context) (*transport.Result, error) {
-	return s.call(ctx, "common.subAccount.getSubAccountApiKeys", nil)
+func (s *SubAccountService) GetSubAccountApiKeys(ctx context.Context) (*transport.Response[[]model.SubAccountAPIKey], error) {
+	return callTyped[[]model.SubAccountAPIKey](s.base, ctx, "common.subAccount.getSubAccountApiKeys", nil)
 }
 
 // ResetSubAccountApiKey — command=reset_subAccount_apikey. MUTATION.
-func (s *SubAccountService) ResetSubAccountApiKey(ctx context.Context, subAccountAPIKey string) (*transport.Result, error) {
+func (s *SubAccountService) ResetSubAccountApiKey(ctx context.Context, subAccountAPIKey string) (*transport.Response[model.NoData], error) {
 	if _, err := requireNonEmpty(subAccountAPIKey, "subAccount_apiKey"); err != nil {
 		return nil, err
 	}
-	return s.call(ctx, "common.subAccount.resetSubAccountApiKey",
+	return callTyped[model.NoData](s.base, ctx, "common.subAccount.resetSubAccountApiKey",
 		map[string]interface{}{"subAccount_apiKey": subAccountAPIKey})
 }
 
@@ -165,7 +166,7 @@ func (s *SubAccountService) ResetSubAccountApiKey(ctx context.Context, subAccoun
 // GATED: the endpoint body shows /api/v1/private while its hyperlink
 // resolves to /api/v1/api/v1/private (doubled prefix). Returns
 // AmbiguousDocumentationError until the route is verified.
-func (s *SubAccountService) GetMaxTransferableAmount(ctx context.Context, coinCode, subUID string) (*transport.Result, error) {
+func (s *SubAccountService) GetMaxTransferableAmount(ctx context.Context, coinCode, subUID string) (*transport.Response[model.WireDecimal], error) {
 	if _, err := requireNonEmpty(coinCode, "coinCode"); err != nil {
 		return nil, err
 	}
@@ -179,7 +180,7 @@ func (s *SubAccountService) GetMaxTransferableAmount(ctx context.Context, coinCo
 // GetTransferHistory — command=returnTransferHistory.
 // All five documented parameters are mandatory. from/to are documented
 // account types 0..4 (Sub* constants).
-func (s *SubAccountService) GetTransferHistory(ctx context.Context, currency string, from, to, pageNo, pageSize int) (*transport.Result, error) {
+func (s *SubAccountService) GetTransferHistory(ctx context.Context, currency string, from, to, pageNo, pageSize int) (*transport.Response[[]model.Transfer], error) {
 	for _, t := range []int{from, to} {
 		if t < 0 || t > 4 {
 			return nil, validationErr("from/to must be a documented account type 0..4")
@@ -191,7 +192,7 @@ func (s *SubAccountService) GetTransferHistory(ctx context.Context, currency str
 	if pageNo < 1 || pageSize < 1 {
 		return nil, validationErr("pageNo and pageSize must be >= 1")
 	}
-	return s.call(ctx, "common.subAccount.getTransferHistory", map[string]interface{}{
+	return callTyped[[]model.Transfer](s.base, ctx, "common.subAccount.getTransferHistory", map[string]interface{}{
 		"currency": currency,
 		"from":     from,
 		"to":       to,
@@ -202,7 +203,7 @@ func (s *SubAccountService) GetTransferHistory(ctx context.Context, currency str
 
 // AccountTransfer — command=subAccount_transfer. MUTATION.
 // side: SubSideOut (Master→Sub) or SubSideIn (Sub→Master); amount decimal string.
-func (s *SubAccountService) AccountTransfer(ctx context.Context, side, subUID, currency, amount string) (*transport.Result, error) {
+func (s *SubAccountService) AccountTransfer(ctx context.Context, side, subUID, currency, amount string) (*transport.Response[model.TransferAcknowledgement], error) {
 	if side != SubSideOut && side != SubSideIn {
 		return nil, validationErr("side must be OUT (Master→Sub) or IN (Sub→Master)")
 	}
@@ -212,7 +213,7 @@ func (s *SubAccountService) AccountTransfer(ctx context.Context, side, subUID, c
 	if _, err := decimalArg(amount, "amount"); err != nil {
 		return nil, err
 	}
-	return s.call(ctx, "common.subAccount.accountTransfer", map[string]interface{}{
+	return callTyped[model.TransferAcknowledgement](s.base, ctx, "common.subAccount.accountTransfer", map[string]interface{}{
 		"side":     side,
 		"subUid":   subUID,
 		"currency": currency,
@@ -300,21 +301,21 @@ func (q AffiliateListQuery) params(maxPageSize int) (map[string]interface{}, err
 }
 
 // GetInvitedUserList — GET .../invitation/user/list.
-func (s *AffiliateService) GetInvitedUserList(ctx context.Context, q AffiliateListQuery) (*transport.Result, error) {
+func (s *AffiliateService) GetInvitedUserList(ctx context.Context, q AffiliateListQuery) (*transport.Response[model.ListPage[model.InvitedUser]], error) {
 	p, err := q.params(1000)
 	if err != nil {
 		return nil, err
 	}
-	return s.call(ctx, "common.affiliate.getInvitedUserList", p)
+	return callTyped[model.ListPage[model.InvitedUser]](s.base, ctx, "common.affiliate.getInvitedUserList", p)
 }
 
 // GetInvitedUsersKycResults — GET .../invitation/user/kyc/list.
-func (s *AffiliateService) GetInvitedUsersKycResults(ctx context.Context, q AffiliateListQuery) (*transport.Result, error) {
+func (s *AffiliateService) GetInvitedUsersKycResults(ctx context.Context, q AffiliateListQuery) (*transport.Response[model.ListPage[model.InvitedUserKYC]], error) {
 	p, err := q.params(1000)
 	if err != nil {
 		return nil, err
 	}
-	return s.call(ctx, "common.affiliate.getInvitedUsersKycResults", p)
+	return callTyped[model.ListPage[model.InvitedUserKYC]](s.base, ctx, "common.affiliate.getInvitedUsersKycResults", p)
 }
 
 // GetInvitedUsersTradingVolume — POST .../invitation/user/volume/list.
@@ -322,7 +323,7 @@ func (s *AffiliateService) GetInvitedUsersKycResults(ctx context.Context, q Affi
 // Documented quirk: a request body is REQUIRED on every call, even an empty
 // JSON object {} — omitting it may fail signature verification. With no
 // filters the SDK sends "{}" explicitly. Date format: "yyyy-MM-dd".
-func (s *AffiliateService) GetInvitedUsersTradingVolume(ctx context.Context, q AffiliateListQuery) (*transport.Result, error) {
+func (s *AffiliateService) GetInvitedUsersTradingVolume(ctx context.Context, q AffiliateListQuery) (*transport.Response[model.ListPage[model.InvitedUserVolume]], error) {
 	if err := requireAffiliateDate(q.StartTime, "startTime"); err != nil {
 		return nil, err
 	}
@@ -348,12 +349,12 @@ func (s *AffiliateService) GetInvitedUsersTradingVolume(ctx context.Context, q A
 	if q.UID > 0 {
 		params["uid"] = q.UID
 	}
-	return s.call(ctx, "common.affiliate.getInvitedUsersTradingVolume", params)
+	return callTyped[model.ListPage[model.InvitedUserVolume]](s.base, ctx, "common.affiliate.getInvitedUsersTradingVolume", params)
 }
 
 // GetAffiliateUserActivityData — POST .../invitation/user/activity/list.
 // activityID is mandatory; uses "page" (not pageNo) per docs.
-func (s *AffiliateService) GetAffiliateUserActivityData(ctx context.Context, activityID string, q AffiliateListQuery) (*transport.Result, error) {
+func (s *AffiliateService) GetAffiliateUserActivityData(ctx context.Context, activityID string, q AffiliateListQuery) (*transport.Response[model.ListPage[model.AffiliateActivity]], error) {
 	if _, err := requireNonEmpty(activityID, "activityId"); err != nil {
 		return nil, err
 	}
@@ -372,12 +373,12 @@ func (s *AffiliateService) GetAffiliateUserActivityData(ctx context.Context, act
 	if q.ShowDetail != "" {
 		p["showDetail"] = q.ShowDetail
 	}
-	return s.call(ctx, "common.affiliate.getAffiliateUserActivityData", p)
+	return callTyped[model.ListPage[model.AffiliateActivity]](s.base, ctx, "common.affiliate.getAffiliateUserActivityData", p)
 }
 
 // GetInvitedUserAssets — GET .../invitation/user/assets.
 // quote: "usdt" (default) or "usdc".
-func (s *AffiliateService) GetInvitedUserAssets(ctx context.Context, q AffiliateListQuery) (*transport.Result, error) {
+func (s *AffiliateService) GetInvitedUserAssets(ctx context.Context, q AffiliateListQuery) (*transport.Response[model.ListPage[model.InvitedUserAssets]], error) {
 	if q.Quote != "" {
 		lq := strings.ToLower(q.Quote)
 		if lq != "usdt" && lq != "usdc" {
@@ -391,13 +392,13 @@ func (s *AffiliateService) GetInvitedUserAssets(ctx context.Context, q Affiliate
 	if q.Quote != "" {
 		p["quote"] = strings.ToLower(q.Quote)
 	}
-	return s.call(ctx, "common.affiliate.getInvitedUserAssets", p)
+	return callTyped[model.ListPage[model.InvitedUserAssets]](s.base, ctx, "common.affiliate.getInvitedUserAssets", p)
 }
 
 // GetAffiliateTeamDirectUserRange — POST .../team/users/range.
 // Documented constraints: partnerUids max 100; type ∈ {0,1,2,3} (0 Futures,
 // 1 Spot, 2 ETF, 3 Futures API) — nil Type omits the filter.
-func (s *AffiliateService) GetAffiliateTeamDirectUserRange(ctx context.Context, q AffiliateListQuery) (*transport.Result, error) {
+func (s *AffiliateService) GetAffiliateTeamDirectUserRange(ctx context.Context, q AffiliateListQuery) (*transport.Response[model.AffiliateTeam], error) {
 	if q.Type != nil && (*q.Type < 0 || *q.Type > 3) {
 		return nil, validationErr("type must be 0 (Futures), 1 (Spot), 2 (ETF) or 3 (Futures API)")
 	}
@@ -414,5 +415,5 @@ func (s *AffiliateService) GetAffiliateTeamDirectUserRange(ctx context.Context, 
 	if len(q.PartnerUIDs) > 0 {
 		p["partnerUids"] = q.PartnerUIDs
 	}
-	return s.call(ctx, "common.affiliate.getAffiliateTeamDirectUserRange", p)
+	return callTyped[model.AffiliateTeam](s.base, ctx, "common.affiliate.getAffiliateTeamDirectUserRange", p)
 }

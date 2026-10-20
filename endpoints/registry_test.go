@@ -98,3 +98,25 @@ func TestDocumentedPathShapes(t *testing.T) {
 		}
 	}
 }
+
+func TestDocumentedRateScopes(t *testing.T) {
+	// Independent checks for the restrictive and asymmetric limits most easily
+	// lost when converting the official Frequency Limit tables into metadata.
+	for _, tc := range []struct {
+		id      string
+		ip, uid float64
+		group   string
+	}{
+		{"futures.market.getBatchLastTradeSummary", 0.2, 0.2, GroupFuturesB},
+		{"futures.assets.getMegaCouponBalance", 0.5, 0.5, GroupFuturesB},
+		{"futures.position.getAllCurrentPositions", 50000, 30, GroupFuturesB},
+		{"futures.position.getHistoricalPositionInformation", 100000, 15, GroupFuturesB},
+		{"spot.account.getFullSpotAccountBalance", 0, 2.5, GroupSpot},
+		{"spot.market.getRecentTrades", 10, 0, GroupSpot},
+	} {
+		ep, ok := Get(tc.id)
+		if !ok || ep.PerIPRPS != tc.ip || ep.PerUIDRPS != tc.uid || ep.RateGroup != tc.group {
+			t.Errorf("%s: incorrect limits: %+v", tc.id, ep)
+		}
+	}
+}

@@ -83,7 +83,7 @@ func SpotSignedURL(baseURL, apiURL string, params map[string]interface{}, apiKey
 	b.WriteString(sign)
 	for _, k := range keys {
 		b.WriteByte('&')
-		b.WriteString(k)
+		b.WriteString(url.QueryEscape(k))
 		b.WriteByte('=')
 		b.WriteString(url.QueryEscape(spotStringify(p[k])))
 	}
@@ -141,8 +141,9 @@ func futuresSign(method, apiURL, suffix, secretKey string, ts int64) FuturesHead
 	}
 }
 
-// FuturesCanonicalQuery builds "k=v&k=v" preserving the given key order —
-// the signed query is the literal query sent to the server.
+// FuturesCanonicalQuery builds the unescaped "k=v&k=v" signing input,
+// preserving key order, as in CoinW's official Python authentication snippet.
+// HTTP query escaping is applied separately after signing, like requests.get.
 func FuturesCanonicalQuery(params map[string]interface{}, keys []string) string {
 	var b strings.Builder
 	first := true
@@ -176,10 +177,17 @@ func SortedParamKeys(params map[string]interface{}) []string {
 // FuturesSignedGet signs a GET: returns the literal query to append and the
 // auth headers (sign, api_key, timestamp).
 func FuturesSignedGet(apiURL string, params map[string]interface{}, apiKey, secretKey string, ts int64) (query string, headers FuturesHeaders) {
-	query = FuturesCanonicalQuery(params, SortedParamKeys(params))
+	canonical := FuturesCanonicalQuery(params, SortedParamKeys(params))
+	values := url.Values{}
+	for k, v := range params {
+		if v != nil {
+			values.Set(k, spotStringify(v))
+		}
+	}
+	query = values.Encode()
 	suffix := ""
-	if query != "" {
-		suffix = "?" + query
+	if canonical != "" {
+		suffix = "?" + canonical
 	}
 	headers = futuresSign("GET", apiURL, suffix, secretKey, ts)
 	headers.APIKey = apiKey
@@ -190,6 +198,9 @@ func FuturesSignedGet(apiURL string, params map[string]interface{}, apiKey, secr
 // and sent. Pass a non-nil empty map/struct for a documented "{}" body.
 func FuturesCanonicalBody(body interface{}) (string, error) {
 	if body == nil {
+		body = map[string]interface{}{}
+	}
+	if params, ok := body.(map[string]interface{}); ok && params == nil {
 		body = map[string]interface{}{}
 	}
 	raw, err := json.Marshal(body)

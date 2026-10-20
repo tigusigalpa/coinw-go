@@ -32,6 +32,8 @@ type Definition struct {
 	Auth            string  // one of Auth*
 	RateGroup       string  // one of Group*
 	PerInterfaceRPS float64 // documented per-interface limit; <=0 = unspecified
+	PerIPRPS        float64 // explicit per-IP interface rate; overrides the legacy shared rate
+	PerUIDRPS       float64 // explicit per-UID interface rate; overrides the legacy shared rate
 	ReadOnly        bool    // idempotent — eligible for auto-retry
 	Ambiguous       bool    // gated by AmbiguousDocumentationError until verified
 	AmbiguityNote   string  // description of the documented conflict
@@ -173,7 +175,7 @@ func build() map[string]Definition {
 	put(futPublicB("futures.market.getInstrumentInfo", "/v1/perpum/instruments"))
 	put(futPublicB("futures.market.getBatchInstrumentsInfo", "/v1/perpum/instrumentList"))
 	put(futPublicA("futures.market.getLastTradeSummaryOfAnInstrument", "/v1/perpumPublic/ticker"))
-	put(futPublicA("futures.market.getBatchLastTradeSummary", "/v1/perpumPublic/ticker/list"))
+	put(futPublicB("futures.market.getBatchLastTradeSummary", "/v1/perpumPublic/ticker/list"))
 	put(futPublicA("futures.market.getLastTradeSummaryOfAllInstruments", "/v1/perpumPublic/tickers"))
 	put(futPublicA("futures.market.getKLineOfAnInstrument", "/v1/perpumPublic/klines"))
 	put(futPublicB("futures.market.getLastSettlementFundingFeeRate", "/v1/perpum/fundingRate"))
@@ -234,5 +236,6 @@ func build() map[string]Definition {
 	put(futPrivate("futures.trade.setStopLossTakeProfitInBatches", "POST", "/v1/perpum/addTpsl", false, 0))
 	put(futPrivate("futures.trade.setTrailingStopLossTakeProfit", "POST", "/v1/perpum/moveTPSL", false, 0))
 
+	applyDocumentedLimits(d)
 	return d
 }

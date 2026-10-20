@@ -21,6 +21,45 @@ func ep(group string, rps float64) endpoints.Definition {
 	}
 }
 
+func TestFractionalRateAllowsOneRequestAndRefills(t *testing.T) {
+	c := &fakeClock{now: time.Unix(0, 0)}
+	l := NewInMemoryLimiter(WithClock(c))
+	bs := l.bucketsFor(ep(endpoints.GroupSpot, 0.5), "")
+	b := bs[len(bs)-1]
+	if w := b.waitDuration(c.Now()); w != 0 {
+		t.Fatalf("first request must be available: %v", w)
+	}
+	b.commit(c.Now())
+	if w := b.waitDuration(c.Now()); w != 2*time.Second {
+		t.Fatalf("expected one token per 2s, got %v", w)
+	}
+	c.Advance(2 * time.Second)
+	if w := b.waitDuration(c.Now()); w != 0 {
+		t.Fatalf("fractional bucket did not refill: %v", w)
+	}
+}
+
+func TestPerInterfaceIPBudgetIsSharedAcrossUIDs(t *testing.T) {
+	c := &fakeClock{now: time.Unix(0, 0)}
+	l := NewInMemoryLimiter(WithClock(c))
+	e := ep(endpoints.GroupFuturesB, 1)
+	if err := l.Acquire(context.Background(), e, "one"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := l.Acquire(ctx, e, "two"); err == nil {
+		t.Fatal("changing UID must not bypass the per-IP interface limit")
+	}
+}
+
+func TestFuturesGlobalBudgetWithoutUID(t *testing.T) {
+	l := NewInMemoryLimiter()
+	if len(l.bucketsFor(ep(endpoints.GroupFuturesB, 0), "")) == 0 {
+		t.Fatal("missing UID must not disable the group B limit")
+	}
+}
+
 // limiter that waits on the fake clock instead of real time — used by
 // overriding Acquire's sleep via a short-circuit: we measure calls, not
 // real elapsed time.

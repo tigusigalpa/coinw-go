@@ -6,6 +6,7 @@
 package websocket
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -95,14 +96,24 @@ func (m *Message) AckSucceeded() bool {
 }
 
 func decodeMessage(raw []byte) (*Message, error) {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.TrimSpace(raw)[0] != '{' {
+		return nil, &coinwerr.ProtocolError{Message: "malformed WS frame (not a JSON object)"}
+	}
 	var m Message
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, &coinwerr.ProtocolError{Message: "malformed WS frame (not a JSON object)"}
 	}
 	var rawMap map[string]interface{}
-	_ = json.Unmarshal(raw, &rawMap)
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	_ = dec.Decode(&rawMap)
 	m.Raw = rawMap
 	m.RawBytes = raw
+	if (m.IsLoginAck() || m.IsSubscribeAck()) && m.ErrorCode == 0 {
+		if _, err := DecodeAcknowledgement(raw); err != nil {
+			return nil, err
+		}
+	}
 	return &m, nil
 }
 
@@ -112,8 +123,7 @@ func frameJSON(event string, params map[string]interface{}) ([]byte, error) {
 
 // subscription is a desired sub kept for automatic resubscribe.
 type subscription struct {
-	key    string
-	params map[string]interface{}
+	frame []byte
 }
 
 // ReconnectPolicy — bounded exponential backoff.
@@ -155,6 +165,13 @@ func (p *ReconnectPolicy) wait(ctx context.Context) error {
 
 func (p *ReconnectPolicy) reset() { p.attempts = 0 }
 
+func cloneReconnect(p *ReconnectPolicy) *ReconnectPolicy {
+	if p == nil {
+		return &ReconnectPolicy{}
+	}
+	return &ReconnectPolicy{BaseDelay: p.BaseDelay, MaxDelay: p.MaxDelay, MaxAttempts: p.MaxAttempts}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -175,6 +192,7 @@ func min(a, b int) int {
 // Private pushes do not include an initial snapshot: after connect and after
 // every reconnect pull the matching REST snapshot before applying events.
 type RawJsonSession struct {
+	profile     Profile
 	url         string
 	private     bool
 	apiKey      string
@@ -184,19 +202,29 @@ type RawJsonSession struct {
 	pingPeriod  time.Duration
 	ackTimeout  time.Duration
 	readTimeout time.Duration
+	onConnect   func(context.Context) error
 
-	mu   sync.Mutex
-	conn Conn
-	subs map[string]subscription
-	auth bool
+	connectMu sync.Mutex
+	runMu     sync.Mutex
+	mu        sync.Mutex
+	conn      *sessionConn
+	subs      map[string]subscription
+	auth      bool
 }
 
 // RawOption customises a session.
 type RawOption func(*RawJsonSession)
 
+// WithOnConnect runs a synchronous hook after authentication on every connect,
+// before Run restores subscriptions. Use it to fetch the matching private REST
+// snapshot; returning an error closes this connection and prevents event delivery.
+func WithOnConnect(hook func(context.Context) error) RawOption {
+	return func(s *RawJsonSession) { s.onConnect = hook }
+}
+
 // WithReconnectPolicy sets a custom reconnect policy.
 func WithReconnectPolicy(p *ReconnectPolicy) RawOption {
-	return func(s *RawJsonSession) { s.reconnect = p }
+	return func(s *RawJsonSession) { s.reconnect = cloneReconnect(p) }
 }
 
 // WithDialer injects a custom dialer (tests/mocks).
@@ -241,11 +269,29 @@ func NewRawJsonSession(url string, private bool, apiKey, secretKey string, opts 
 }
 
 // IsAuthenticated reports whether the documented login succeeded.
-func (s *RawJsonSession) IsAuthenticated() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.auth }
+func (s *RawJsonSession) IsAuthenticated() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.auth && s.conn != nil && s.conn.active()
+}
 
 // Connect opens the connection; performs the documented login for private
 // sessions (blocks until the login ack or ackTimeout).
 func (s *RawJsonSession) Connect(ctx context.Context) error {
+	s.connectMu.Lock()
+	defer s.connectMu.Unlock()
+	s.mu.Lock()
+	connected := s.conn != nil && s.conn.active()
+	s.mu.Unlock()
+	if connected {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.private && (s.apiKey == "" || s.secretKey == "") {
+		return &coinwerr.AuthenticationError{Message: "private WS session requires api key and secret key"}
+	}
 	conn, resp, err := s.dialer.DialContext(ctx, s.url, nil)
 	if err != nil {
 		status := ""
@@ -254,48 +300,57 @@ func (s *RawJsonSession) Connect(ctx context.Context) error {
 		}
 		return &coinwerr.TransportError{Message: "websocket dial failed" + status, Err: err}
 	}
-	s.mu.Lock()
-	s.conn = conn
-	s.auth = false
-	s.mu.Unlock()
+	c := newSessionConn(ctx, conn)
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			_ = c.Close()
+		}
+	}()
 
 	if s.private {
-		if s.apiKey == "" || s.secretKey == "" {
-			conn.Close()
-			return &coinwerr.AuthenticationError{Message: "private WS session requires api key and secret key"}
-		}
 		frame, _ := frameJSON("login", map[string]interface{}{
 			"api_key": s.apiKey, "passphrase": s.secretKey,
 		})
-		if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
-			conn.Close()
+		if err := c.WriteMessage(websocket.TextMessage, frame); err != nil {
 			return &coinwerr.TransportError{Message: "failed to send login frame", Err: err}
 		}
-		if err := s.awaitLoginAck(ctx); err != nil {
-			conn.Close()
+		if err := s.awaitLoginAck(ctx, c); err != nil {
 			return err
 		}
-		s.mu.Lock()
-		s.auth = true
-		s.mu.Unlock()
 	}
+	if s.onConnect != nil {
+		if err := s.onConnect(ctx); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
+	s.conn = c
+	s.auth = s.private
+	s.mu.Unlock()
+	succeeded = true
 	return nil
 }
 
-func (s *RawJsonSession) awaitLoginAck(ctx context.Context) error {
+func (s *RawJsonSession) awaitLoginAck(ctx context.Context, conn *sessionConn) error {
 	deadline := time.Now().Add(s.ackTimeout)
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		_ = s.conn.SetReadDeadline(deadline)
-		_, raw, err := s.conn.ReadMessage()
+		_, raw, err := conn.read(time.Until(deadline))
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+				return context.DeadlineExceeded
+			}
 			return &coinwerr.TransportError{Message: "failed reading login ack", Err: err}
 		}
 		m, err := decodeMessage(raw)
 		if err != nil {
-			continue
+			return err
 		}
 		if m.IsLoginAck() {
 			if m.AckSucceeded() {
@@ -327,7 +382,9 @@ func (s *RawJsonSession) Subscribe(params map[string]interface{}) error {
 	if err := s.conn.WriteMessage(websocket.TextMessage, frame); err != nil {
 		return &coinwerr.TransportError{Message: "subscribe send failed", Err: err}
 	}
-	s.subs[subKey(params)] = subscription{key: subKey(params), params: params}
+	// The encoded frame is an immutable snapshot, including nested params.
+	key := subKey(params)
+	s.subs[key] = subscription{frame: frame}
 	return nil
 }
 
@@ -359,7 +416,8 @@ func (s *RawJsonSession) Ping() error {
 	return s.conn.WriteMessage(websocket.TextMessage, []byte(`{"event":"ping"}`))
 }
 
-// ReadMessage reads and decodes the next frame. nil,nil on read timeout.
+// ReadMessage reads and decodes the next frame. A read timeout is fatal to
+// the connection and is returned so Run can reconnect.
 func (s *RawJsonSession) ReadMessage() (*Message, error) {
 	s.mu.Lock()
 	conn := s.conn
@@ -367,12 +425,8 @@ func (s *RawJsonSession) ReadMessage() (*Message, error) {
 	if conn == nil {
 		return nil, &coinwerr.TransportError{Message: "websocket is not connected"}
 	}
-	_ = conn.SetReadDeadline(time.Now().Add(s.readTimeout))
-	mt, raw, err := conn.ReadMessage()
+	mt, raw, err := conn.read(s.readTimeout)
 	if err != nil {
-		if isTimeout(err) {
-			return nil, nil
-		}
 		return nil, &coinwerr.TransportError{Message: "websocket read failed", Err: err}
 	}
 	if mt != websocket.TextMessage && mt != websocket.BinaryMessage {
@@ -386,13 +440,21 @@ func (s *RawJsonSession) ReadMessage() (*Message, error) {
 // onEvent receives every decoded frame except pong. Run returns when ctx is
 // cancelled or a fatal error escapes onError (return false to stop).
 func (s *RawJsonSession) Run(ctx context.Context, onEvent func(*Message) bool, onError func(error) bool) error {
-	lastPing := time.Time{}
+	if !s.runMu.TryLock() {
+		return &coinwerr.ValidationError{Message: "Run is already active"}
+	}
+	defer s.runMu.Unlock()
+	defer s.closeQuietly()
+	if onEvent == nil || onError == nil {
+		return &coinwerr.ValidationError{Message: "Run requires event and error callbacks"}
+	}
+reconnectLoop:
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		s.mu.Lock()
-		connected := s.conn != nil
+		connected := s.conn != nil && s.conn.active()
 		s.mu.Unlock()
 
 		if !connected {
@@ -406,7 +468,6 @@ func (s *RawJsonSession) Run(ctx context.Context, onEvent func(*Message) bool, o
 				continue
 			}
 			s.reconnect.reset()
-			lastPing = time.Time{}
 			// resubscribe desired set
 			s.mu.Lock()
 			subs := make([]subscription, 0, len(s.subs))
@@ -414,28 +475,41 @@ func (s *RawJsonSession) Run(ctx context.Context, onEvent func(*Message) bool, o
 				subs = append(subs, sub)
 			}
 			conn := s.conn
-			s.mu.Unlock()
 			for _, sub := range subs {
-				frame, _ := frameJSON("sub", sub.params)
-				if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
-					break
+				if err := conn.WriteMessage(websocket.TextMessage, sub.frame); err != nil {
+					s.mu.Unlock()
+					s.closeQuietly()
+					if !onError(err) {
+						return err
+					}
+					if err := s.reconnect.wait(ctx); err != nil {
+						return err
+					}
+					continue reconnectLoop
 				}
 			}
+			s.mu.Unlock()
 		}
-
-		if time.Since(lastPing) >= s.pingPeriod {
-			if err := s.Ping(); err != nil {
-				if !onError(err) {
-					return err
-				}
-				s.closeQuietly()
-				continue
+		s.mu.Lock()
+		conn := s.conn
+		s.mu.Unlock()
+		if conn == nil {
+			continue
+		}
+		err := runIO(ctx, s.pingPeriod, s.Ping, func() (interface{}, error) {
+			msg, err := s.ReadMessage()
+			if msg == nil || msg.IsPong() {
+				return nil, err
 			}
-			lastPing = time.Now()
-		}
-
-		msg, err := s.ReadMessage()
+			if rejection := msg.AsError(); rejection != nil {
+				return nil, rejection
+			}
+			return msg, err
+		}, func(msg interface{}) bool { return onEvent(msg.(*Message)) }, conn)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if !onError(err) {
 				return err
 			}
@@ -445,12 +519,7 @@ func (s *RawJsonSession) Run(ctx context.Context, onEvent func(*Message) bool, o
 			}
 			continue
 		}
-		if msg == nil || msg.IsPong() {
-			continue
-		}
-		if !onEvent(msg) {
-			return nil
-		}
+		return nil
 	}
 }
 
@@ -472,13 +541,6 @@ func (s *RawJsonSession) closeQuietly() { _ = s.Close() }
 func subKey(params map[string]interface{}) string {
 	raw, _ := json.Marshal(params)
 	return string(raw)
-}
-
-func isTimeout(err error) bool {
-	if ne, ok := err.(interface{ Timeout() bool }); ok {
-		return ne.Timeout()
-	}
-	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -511,9 +573,11 @@ type SocketIOSession struct {
 	pingPeriod  time.Duration
 	readTimeout time.Duration
 
-	mu   sync.Mutex
-	conn Conn
-	args map[string]struct{}
+	connectMu sync.Mutex
+	runMu     sync.Mutex
+	mu        sync.Mutex
+	conn      *sessionConn
+	args      map[string]struct{}
 }
 
 // SocketIOOption customises a session.
@@ -521,7 +585,7 @@ type SocketIOOption func(*SocketIOSession)
 
 func WithSocketIODialer(d Dialer) SocketIOOption { return func(s *SocketIOSession) { s.dialer = d } }
 func WithSocketIOReconnect(p *ReconnectPolicy) SocketIOOption {
-	return func(s *SocketIOSession) { s.reconnect = p }
+	return func(s *SocketIOSession) { s.reconnect = cloneReconnect(p) }
 }
 func WithSocketIOTimeouts(ping, read time.Duration) SocketIOOption {
 	return func(s *SocketIOSession) {
@@ -554,6 +618,17 @@ func NewSocketIOSession(host string, tokenSource PublicTokenSource, opts ...Sock
 
 // Connect fetches the public token and dials.
 func (s *SocketIOSession) Connect(ctx context.Context) error {
+	s.connectMu.Lock()
+	defer s.connectMu.Unlock()
+	s.mu.Lock()
+	connected := s.conn != nil && s.conn.active()
+	s.mu.Unlock()
+	if connected {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.tokenSource == nil {
 		return &coinwerr.ValidationError{Message: "a PublicTokenSource is required"}
 	}
@@ -578,6 +653,11 @@ func (s *SocketIOSession) Connect(ctx context.Context) error {
 	}
 	q := u.Query()
 	q.Set("token", token)
+	q.Set("EIO", "4")
+	q.Set("transport", "websocket")
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/socket.io/"
+	}
 	u.RawQuery = q.Encode()
 
 	conn, resp, err := s.dialer.DialContext(ctx, u.String(), nil)
@@ -588,8 +668,40 @@ func (s *SocketIOSession) Connect(ctx context.Context) error {
 		}
 		return &coinwerr.TransportError{Message: "websocket dial failed" + status, Err: err}
 	}
+	c := newSessionConn(ctx, conn)
+	// Socket.IO forbids EVENT packets until the namespace CONNECT succeeds.
+	deadline := time.Now().Add(s.readTimeout)
+	opened := false
+	for {
+		mt, raw, err := c.read(time.Until(deadline))
+		if err != nil {
+			_ = c.Close()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return &coinwerr.TransportError{Message: "failed reading Socket.IO handshake", Err: err}
+		}
+		if mt != websocket.TextMessage || len(raw) == 0 {
+			_ = c.Close()
+			return &coinwerr.ProtocolError{Message: "invalid Socket.IO handshake frame"}
+		}
+		if raw[0] == '0' {
+			opened = true
+		}
+		if opened && (string(raw) == "40" || bytes.HasPrefix(raw, []byte("40{"))) {
+			break
+		}
+		if _, err := s.handlePacket(c, raw); err != nil {
+			_ = c.Close()
+			return err
+		}
+		if time.Now().After(deadline) {
+			_ = c.Close()
+			return &coinwerr.TransportError{Message: "timed out waiting for Socket.IO handshake"}
+		}
+	}
 	s.mu.Lock()
-	s.conn = conn
+	s.conn = c
 	s.mu.Unlock()
 	return nil
 }
@@ -649,7 +761,7 @@ func (s *SocketIOSession) Ping() error {
 }
 
 // ReadMessage returns the next Socket.IO event, or nil,nil for engine-level
-// frames/timeouts. Engine.IO pings are answered automatically.
+// frames. Engine.IO pings are answered automatically; read timeouts are fatal.
 func (s *SocketIOSession) ReadMessage() (*SocketIOMessage, error) {
 	s.mu.Lock()
 	conn := s.conn
@@ -657,12 +769,8 @@ func (s *SocketIOSession) ReadMessage() (*SocketIOMessage, error) {
 	if conn == nil {
 		return nil, &coinwerr.TransportError{Message: "websocket is not connected"}
 	}
-	_ = conn.SetReadDeadline(time.Now().Add(s.readTimeout))
-	mt, raw, err := conn.ReadMessage()
+	mt, raw, err := conn.read(s.readTimeout)
 	if err != nil {
-		if isTimeout(err) {
-			return nil, nil
-		}
 		return nil, &coinwerr.TransportError{Message: "websocket read failed", Err: err}
 	}
 	if mt != websocket.TextMessage || len(raw) == 0 {
@@ -732,13 +840,21 @@ func (s *SocketIOSession) handleSocketIO(conn Conn, payload []byte) (*SocketIOMe
 
 // Run is the blocking loop with reconnect + resubscribe.
 func (s *SocketIOSession) Run(ctx context.Context, onEvent func(*SocketIOMessage) bool, onError func(error) bool) error {
-	lastPing := time.Time{}
+	if !s.runMu.TryLock() {
+		return &coinwerr.ValidationError{Message: "Run is already active"}
+	}
+	defer s.runMu.Unlock()
+	defer s.closeQuietly()
+	if onEvent == nil || onError == nil {
+		return &coinwerr.ValidationError{Message: "Run requires event and error callbacks"}
+	}
+reconnectLoop:
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		s.mu.Lock()
-		connected := s.conn != nil
+		connected := s.conn != nil && s.conn.active()
 		s.mu.Unlock()
 
 		if !connected {
@@ -752,35 +868,45 @@ func (s *SocketIOSession) Run(ctx context.Context, onEvent func(*SocketIOMessage
 				continue
 			}
 			s.reconnect.reset()
-			lastPing = time.Time{}
 			s.mu.Lock()
 			args := make([]string, 0, len(s.args))
 			for a := range s.args {
 				args = append(args, a)
 			}
 			conn := s.conn
-			s.mu.Unlock()
 			for _, a := range args {
 				frame, _ := sioEvent("subscribe", map[string]interface{}{"args": a})
 				if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
-					break
+					s.mu.Unlock()
+					s.closeQuietly()
+					if !onError(err) {
+						return err
+					}
+					if err := s.reconnect.wait(ctx); err != nil {
+						return err
+					}
+					continue reconnectLoop
 				}
 			}
+			s.mu.Unlock()
 		}
-
-		if time.Since(lastPing) >= s.pingPeriod {
-			if err := s.Ping(); err != nil {
-				if !onError(err) {
-					return err
-				}
-				s.closeQuietly()
-				continue
+		s.mu.Lock()
+		conn := s.conn
+		s.mu.Unlock()
+		if conn == nil {
+			continue
+		}
+		err := runIO(ctx, s.pingPeriod, s.Ping, func() (interface{}, error) {
+			msg, err := s.ReadMessage()
+			if msg == nil {
+				return nil, err
 			}
-			lastPing = time.Now()
-		}
-
-		msg, err := s.ReadMessage()
+			return msg, err
+		}, func(msg interface{}) bool { return onEvent(msg.(*SocketIOMessage)) }, conn)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if !onError(err) {
 				return err
 			}
@@ -790,12 +916,7 @@ func (s *SocketIOSession) Run(ctx context.Context, onEvent func(*SocketIOMessage
 			}
 			continue
 		}
-		if msg == nil {
-			continue
-		}
-		if !onEvent(msg) {
-			return nil
-		}
+		return nil
 	}
 }
 
@@ -829,29 +950,34 @@ func sioEvent(event string, payload map[string]interface{}) ([]byte, error) {
 type DepthTrackResult int
 
 const (
-	DepthApplied    DepthTrackResult = iota // event applied in sequence
-	DepthDuplicate                          // out-of-order old event — discard
-	DepthGap                                // startSeq > expected → resync from snapshot
-	DepthNoSequence                         // event lacks startSeq/endSeq
+	DepthApplied       DepthTrackResult = iota // event applied in sequence
+	DepthDuplicate                             // out-of-order old event — discard
+	DepthGap                                   // startSeq > expected → resync from snapshot
+	DepthNoSequence                            // event lacks startSeq/endSeq
+	DepthNeedsSnapshot                         // no documented snapshot has anchored the book
 )
 
 // DepthSequenceTracker detects sequence gaps in the spot incremental order
 // book (startSeq/endSeq per event). On DepthGap the caller must re-fetch a
 // snapshot (depth_snapshot channel) and call Reset with its last seq.
 type DepthSequenceTracker struct {
+	mu           sync.Mutex
 	expectedNext int64
 	hasExpected  bool
 }
 
 // Track feeds one event.
 func (t *DepthSequenceTracker) Track(startSeq, endSeq *int64) DepthTrackResult {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if startSeq == nil || endSeq == nil {
 		return DepthNoSequence
 	}
+	if *endSeq < *startSeq || *endSeq == int64(^uint64(0)>>1) {
+		return DepthNoSequence
+	}
 	if !t.hasExpected {
-		t.expectedNext = *endSeq + 1
-		t.hasExpected = true
-		return DepthApplied
+		return DepthNeedsSnapshot
 	}
 	if *endSeq < t.expectedNext {
 		return DepthDuplicate
@@ -866,12 +992,33 @@ func (t *DepthSequenceTracker) Track(startSeq, endSeq *int64) DepthTrackResult {
 
 // Reset anchors the sequence after a fresh snapshot.
 func (t *DepthSequenceTracker) Reset(lastSnapshotSeq int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.expectedNext = lastSnapshotSeq + 1
 	t.hasExpected = true
 }
 
+// TrackAndResync requests the documented depth_snapshot stream on an absent
+// snapshot or sequence gap. The caller supplies its subscription operation;
+// only Reset after receiving that snapshot anchors the sequence again.
+func (t *DepthSequenceTracker) TrackAndResync(ctx context.Context, startSeq, endSeq *int64, requestSnapshot func(context.Context) error) (DepthTrackResult, error) {
+	if err := ctx.Err(); err != nil {
+		return DepthNoSequence, err
+	}
+	result := t.Track(startSeq, endSeq)
+	if result == DepthGap || result == DepthNeedsSnapshot {
+		if requestSnapshot == nil {
+			return result, &coinwerr.ValidationError{Message: "depth resync requires a documented snapshot callback"}
+		}
+		return result, requestSnapshot(ctx)
+	}
+	return result, nil
+}
+
 // ExpectedNext returns the next expected startSeq (0 before anchoring).
 func (t *DepthSequenceTracker) ExpectedNext() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if !t.hasExpected {
 		return 0
 	}

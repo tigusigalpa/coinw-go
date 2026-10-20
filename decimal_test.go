@@ -1,6 +1,7 @@
 package coinw
 
 import (
+	"encoding/json"
 	"testing"
 )
 
@@ -26,5 +27,20 @@ func TestDecimal(t *testing.T) {
 	raw, _ := MustDecimal("1.5").MarshalJSON()
 	if string(raw) != `"1.5"` {
 		t.Errorf("marshal: %s", raw)
+	}
+}
+
+func TestDecimalJSONBoundary(t *testing.T) {
+	for _, raw := range []string{`"invalid"`, `"1e5"`, `1.5`, `null`} {
+		d := MustDecimal("1.000")
+		if err := json.Unmarshal([]byte(raw), &d); err == nil {
+			t.Errorf("invalid decimal JSON accepted: %s", raw)
+		}
+		if d.String() != "1.000" {
+			t.Fatal("failed decoding changed the destination")
+		}
+	}
+	if _, err := json.Marshal(Decimal("invalid")); err == nil {
+		t.Fatal("invalid cast Decimal was serialized")
 	}
 }

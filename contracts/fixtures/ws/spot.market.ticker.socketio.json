@@ -1,0 +1,1 @@
+{"channel":"spot/market-api-ticker:BTC-USDT","subject":"spot/market-api-ticker","data":"{\n\"buy\":\"82821.35\",\n\"changePrice\":\"-610.48\",\n\"changeRate\":\"-0.007317\",\n\"high\":\"83799.09\",\n\"last\":\"82821.45\",\n\"low\":\"79998.45\",\n\"open\":\"83431.93\",\n\"sell\":\"82821.40\",\n\"symbol\":\"78\",\n\"vol\":\"10329.2388\",\n\"volValue\":\"843619014.31\"\n}"}

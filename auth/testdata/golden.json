@@ -1,0 +1,53 @@
+{
+  "sourceSpot": "https://www.coinw.com/api-doc/en/common/certify-code-spot",
+  "sourceFutures": "https://www.coinw.com/api-doc/en/common/certify-code-futures",
+  "provenance": "Authentication algorithms and request shapes from the official examples; synthetic keys and independently calculated fixed digests.",
+  "apiKey": "fixture-api-key",
+  "secretKey": "fixture-secret",
+  "timestamp": 1743154440000,
+  "spot": {
+    "params": {
+      "symbol": "BTC_USDT",
+      "type": 0,
+      "amount": "0.1000",
+      "rate": "83000",
+      "isMarket": false,
+      "out_trade_no": "fixture-order"
+    },
+    "canonical": "amount=0.1000&api_key=fixture-api-key&isMarket=false&out_trade_no=fixture-order&rate=83000&symbol=BTC_USDT&type=0&secret_key=fixture-secret",
+    "signature": "FFCCA73FC4E9D5EF8F904DDCD74B80E3"
+  },
+  "get": {
+    "path": "/api/v3/patener/openapi/v1/partner/invitation/user/list",
+    "params": {
+      "startTime": "2026-10-20 00:00:00",
+      "referralCode": "a&b+c#d?e=ж"
+    },
+    "query": "referralCode=a&b+c#d?e=ж&startTime=2026-10-20 00:00:00",
+    "canonical": "1743154440000GET/api/v3/patener/openapi/v1/partner/invitation/user/list?referralCode=a&b+c#d?e=ж&startTime=2026-10-20 00:00:00",
+    "signature": "RHqtC1pk8rj2hoAHKV5Wy84PNuQ11Q9UvibPl9HfID0="
+  },
+  "post": {
+    "path": "/v1/perpum/order",
+    "body": {
+      "direction": "long",
+      "instrument": "BTC",
+      "leverage": 2,
+      "openPrice": "83000",
+      "positionModel": 0,
+      "positionType": "plan",
+      "quantity": "100.0000",
+      "quantityUnit": 0,
+      "thirdOrderId": "fixture-order"
+    },
+    "payload": "{\"direction\":\"long\",\"instrument\":\"BTC\",\"leverage\":2,\"openPrice\":\"83000\",\"positionModel\":0,\"positionType\":\"plan\",\"quantity\":\"100.0000\",\"quantityUnit\":0,\"thirdOrderId\":\"fixture-order\"}",
+    "canonical": "1743154440000POST/v1/perpum/order{\"direction\":\"long\",\"instrument\":\"BTC\",\"leverage\":2,\"openPrice\":\"83000\",\"positionModel\":0,\"positionType\":\"plan\",\"quantity\":\"100.0000\",\"quantityUnit\":0,\"thirdOrderId\":\"fixture-order\"}",
+    "signature": "ftNpb72R+bGpG7Zt6U/B74Dpjap4GwnaQ+Fx/rBvwro="
+  },
+  "emptyPost": {
+    "path": "/api/v3/patener/openapi/v1/partner/invitation/user/volume/list",
+    "payload": "{}",
+    "canonical": "1743154440000POST/api/v3/patener/openapi/v1/partner/invitation/user/volume/list{}",
+    "signature": "nHOeZ1wPeK86PiBBH/WCtos5Y5tyPBm5itebsI0e7x0="
+  }
+}

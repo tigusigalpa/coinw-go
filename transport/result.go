@@ -3,19 +3,20 @@
 package transport
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"mime"
 	"net/http"
-	"strconv"
+	"strings"
 
 	"github.com/tigusigalpa/coinw-go/endpoints"
 	coinwerr "github.com/tigusigalpa/coinw-go/errors"
 )
 
-// Result is the typed envelope returned for every REST call. The Data field
-// preserves the documented payload shape; monetary leaf values remain
-// decimal strings exactly as returned by the API (json.Decoder with
-// UseNumber is recommended when decoding into structs).
+// Result is the original REST envelope retained by Response[T] and the
+// low-level executor. Data and Envelope can contain private values; never log
+// them. Public services validate endpoint-specific typed Data before returning.
 type Result struct {
 	Code       json.RawMessage // business code ("200", "0", 29001, …)
 	Msg        string          // message field, when present
@@ -39,12 +40,15 @@ func (r *Result) IsSuccess() bool {
 	return false
 }
 
-// DecodeData unmarshals the data field into v.
+// DecodeData decodes data into v. Interface-valued numeric leaves use
+// json.Number to preserve decimal precision and IDs larger than 2^53.
 func (r *Result) DecodeData(v interface{}) error {
 	if len(r.Data) == 0 {
 		return nil
 	}
-	return json.Unmarshal(r.Data, v)
+	dec := json.NewDecoder(bytes.NewReader(r.Data))
+	dec.UseNumber()
+	return dec.Decode(v)
 }
 
 var authErrorCodes = map[string]bool{
@@ -64,15 +68,20 @@ func validateResponse(resp *http.Response, body []byte, ep endpoints.Definition)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, &coinwerr.HTTPStatusError{
 			StatusCode: resp.StatusCode,
-			Message:    truncate(coinwerr.Redact(string(body)), 300),
+			Message:    "request failed at " + ep.ID,
+		}
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		mediaType, _, err := mime.ParseMediaType(ct)
+		if err != nil || (mediaType != "application/json" && !strings.HasSuffix(mediaType, "+json")) {
+			return nil, &coinwerr.ProtocolError{Message: "expected a JSON Content-Type for " + ep.ID}
 		}
 	}
 
 	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(body, &envelope); err != nil {
+	if err := json.Unmarshal(body, &envelope); err != nil || envelope == nil {
 		return nil, &coinwerr.ProtocolError{
-			Message: "malformed JSON response for " + ep.ID + ": " +
-				truncate(coinwerr.Redact(string(body)), 300),
+			Message: "expected a JSON object response for " + ep.ID,
 		}
 	}
 
@@ -86,11 +95,14 @@ func validateResponse(resp *http.Response, body []byte, ep endpoints.Definition)
 	}
 	codeStr := codeToString(codeRaw)
 	errCodeStr := codeToString(envelope["errorCode"])
+	if codeStr == "" && errCodeStr == "" {
+		return nil, &coinwerr.ProtocolError{Message: "response missing a valid business code for " + ep.ID}
+	}
 
 	isSuccess := (codeStr == "200" || codeStr == "0") &&
 		!rawBoolFalse(envelope["success"]) &&
 		!rawBoolFalse(envelope["result"]) &&
-		len(envelope["errorCode"]) == 0
+		(len(envelope["errorCode"]) == 0 || bytes.Equal(bytes.TrimSpace(envelope["errorCode"]), []byte("null")))
 
 	if !isSuccess {
 		effCode := codeStr
@@ -142,8 +154,7 @@ func readStringField(env map[string]json.RawMessage, key string) string {
 }
 
 func rawBoolFalse(raw json.RawMessage) bool {
-	var b bool
-	return json.Unmarshal(raw, &b) == nil && !b
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("false"))
 }
 
 func codeToString(raw json.RawMessage) string {
@@ -154,16 +165,11 @@ func codeToString(raw json.RawMessage) string {
 	if err := json.Unmarshal(raw, &s); err == nil {
 		return s
 	}
-	var f float64
-	if err := json.Unmarshal(raw, &f); err == nil {
-		return strconv.FormatFloat(f, 'f', -1, 64)
+	var n json.Number
+	if err := json.Unmarshal(raw, &n); err == nil {
+		if _, err := n.Int64(); err == nil {
+			return n.String()
+		}
 	}
 	return ""
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
 }

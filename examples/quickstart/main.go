@@ -37,7 +37,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(string(res.Data))
+	fmt.Printf("trades: %d\n", len(res.Data))
 
 	// --- Private reads ---
 	// fmt.Println(c.SpotAccount().GetSpotAccountBalance(ctx))

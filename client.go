@@ -14,6 +14,7 @@ package coinw
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"time"
 
@@ -78,6 +79,8 @@ type ClientConfig struct {
 	Clock          transport.Clock
 	Dialer         ws.Dialer
 	MaxReadRetries int
+	RetryBackoff   func(int) time.Duration
+	RetrySleep     func(context.Context, time.Duration) error
 }
 
 // ClientOption mutates ClientConfig during NewClient.
@@ -139,6 +142,12 @@ func WithMaxReadRetries(n int) ClientOption {
 	return func(c *ClientConfig) { c.MaxReadRetries = n }
 }
 
+// WithRetryPolicy injects concurrency-safe deterministic backoff/sleep hooks.
+// Delays are bounded to 0..5 seconds; the endpoint retry safety rule still applies.
+func WithRetryPolicy(backoff func(int) time.Duration, sleep func(context.Context, time.Duration) error) ClientOption {
+	return func(c *ClientConfig) { c.RetryBackoff, c.RetrySleep = backoff, sleep }
+}
+
 // WithWebSocketURLs overrides documented WS endpoints (testing/proxy).
 func WithWebSocketURLs(spot, futures, socketIO, tokenURL string) ClientOption {
 	return func(c *ClientConfig) {
@@ -175,9 +184,11 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 	httpDo := cfg.HTTPClient
 	if httpDo == nil {
 		httpDo = &http.Client{Timeout: cfg.RequestTimeout}
-	} else if httpDo.Timeout == 0 && cfg.RequestTimeout > 0 {
+	} else {
 		clone := *httpDo
-		clone.Timeout = cfg.RequestTimeout
+		if clone.Timeout == 0 && cfg.RequestTimeout > 0 {
+			clone.Timeout = cfg.RequestTimeout
+		}
 		httpDo = &clone
 	}
 
@@ -197,6 +208,8 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 		Limiter:          limiter,
 		Clock:            cfg.Clock,
 		MaxReadRetries:   cfg.MaxReadRetries,
+		RetryBackoff:     cfg.RetryBackoff,
+		RetrySleep:       cfg.RetrySleep,
 		RequestTimeout:   cfg.RequestTimeout,
 	})
 	if err != nil {
@@ -245,7 +258,7 @@ func (c *Client) Affiliate() *services.AffiliateService       { return c.affilia
 // Incremental depth requires DepthSequenceTracker + snapshot resync.
 func (c *Client) SpotPublicWS(opts ...ws.RawOption) *ws.RawJsonSession {
 	return ws.NewRawJsonSession(c.cfg.SpotWSURL, false, "", "",
-		append([]ws.RawOption{ws.WithDialer(c.dialerOrDefault())}, opts...)...)
+		append([]ws.RawOption{ws.WithDialer(c.dialerOrDefault()), ws.WithProfile(ws.SpotProfile)}, opts...)...)
 }
 
 // SpotPrivateWS — same URL + documented login frame. Requires Spot creds.
@@ -256,7 +269,7 @@ func (c *Client) SpotPrivateWS(opts ...ws.RawOption) (*ws.RawJsonSession, error)
 		}
 	}
 	return ws.NewRawJsonSession(c.cfg.SpotWSURL, true, c.cfg.SpotAPIKey, c.cfg.SpotSecretKey,
-		append([]ws.RawOption{ws.WithDialer(c.dialerOrDefault())}, opts...)...), nil
+		append([]ws.RawOption{ws.WithDialer(c.dialerOrDefault()), ws.WithProfile(ws.SpotProfile)}, opts...)...), nil
 }
 
 // SpotSocketIOWS — Spot public Method 1 (Socket.IO + token fetch).
@@ -268,7 +281,7 @@ func (c *Client) SpotSocketIOWS(opts ...ws.SocketIOOption) *ws.SocketIOSession {
 // FuturesPublicWS — Futures public stream on /perpum.
 func (c *Client) FuturesPublicWS(opts ...ws.RawOption) *ws.RawJsonSession {
 	return ws.NewRawJsonSession(c.cfg.FuturesWSURL, false, "", "",
-		append([]ws.RawOption{ws.WithDialer(c.dialerOrDefault())}, opts...)...)
+		append([]ws.RawOption{ws.WithDialer(c.dialerOrDefault()), ws.WithProfile(ws.FuturesProfile)}, opts...)...)
 }
 
 // FuturesPrivateWS — /perpum + documented login. Requires Futures creds.
@@ -279,7 +292,7 @@ func (c *Client) FuturesPrivateWS(opts ...ws.RawOption) (*ws.RawJsonSession, err
 		}
 	}
 	return ws.NewRawJsonSession(c.cfg.FuturesWSURL, true, c.cfg.FuturesAPIKey, c.cfg.FuturesSecretKey,
-		append([]ws.RawOption{ws.WithDialer(c.dialerOrDefault())}, opts...)...), nil
+		append([]ws.RawOption{ws.WithDialer(c.dialerOrDefault()), ws.WithProfile(ws.FuturesProfile)}, opts...)...), nil
 }
 
 func (c *Client) dialerOrDefault() ws.Dialer {
@@ -292,6 +305,11 @@ func (c *Client) dialerOrDefault() ws.Dialer {
 // fetchPublicToken implements the documented token retrieval:
 // GET {spotPublicTokenUrl} → {"code":"200","data":{"endpoint":…,"token":…}}.
 func (c *Client) fetchPublicToken(ctx context.Context) (string, string, error) {
+	if c.cfg.RequestTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.cfg.RequestTimeout)
+		defer cancel()
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.SpotPublicTokenURL, nil)
 	if err != nil {
 		return "", "", err
@@ -302,6 +320,7 @@ func (c *Client) fetchPublicToken(ctx context.Context) (string, string, error) {
 	}
 	defer resp.Body.Close()
 	var payload struct {
+		Code json.RawMessage `json:"code"`
 		Data struct {
 			Token    string `json:"token"`
 			Endpoint string `json:"endpoint"`
@@ -310,8 +329,16 @@ func (c *Client) fetchPublicToken(ctx context.Context) (string, string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return "", "", &coinwerr.HTTPStatusError{StatusCode: resp.StatusCode, Message: "public WS token endpoint"}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", "", &coinwerr.ProtocolError{Message: "malformed public WS token response: " + err.Error()}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if err != nil {
+		return "", "", &coinwerr.TransportError{Message: "failed reading public WS token response", Err: err}
+	}
+	if len(raw) > 1<<20 || json.Unmarshal(raw, &payload) != nil {
+		return "", "", &coinwerr.ProtocolError{Message: "malformed public WS token response"}
+	}
+	result := transport.Result{Code: payload.Code}
+	if (len(payload.Code) > 0 && !result.IsSuccess()) || payload.Data.Token == "" {
+		return "", "", &coinwerr.ProtocolError{Message: "public WS token response must contain data.token and no failure code"}
 	}
 	return payload.Data.Token, payload.Data.Endpoint, nil
 }

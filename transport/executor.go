@@ -42,8 +42,10 @@ type Config struct {
 	HTTPClient       HTTPDoer // required
 	Limiter          ratelimit.Limiter
 	Clock            Clock
-	MaxReadRetries   int           // automatic retries for read-only endpoints only
-	RequestTimeout   time.Duration // per-attempt timeout; 0 = no extra timeout
+	MaxReadRetries   int                                        // automatic retries for read-only endpoints only
+	RequestTimeout   time.Duration                              // per-attempt timeout; 0 = no extra timeout
+	RetryBackoff     func(attempt int) time.Duration            // nil uses bounded exponential backoff with jitter
+	RetrySleep       func(context.Context, time.Duration) error // nil uses context-aware timers
 }
 
 // Executor runs the central request pipeline. Construct via NewExecutor.
@@ -53,6 +55,10 @@ type Executor struct {
 
 // NewExecutor builds the pipeline. HTTPClient is required.
 func NewExecutor(cfg Config) (*Executor, error) {
+	u, err := url.Parse(cfg.BaseURL)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return nil, &coinwerr.ValidationError{Message: "BaseURL must be an absolute HTTP(S) URL without credentials, query or fragment"}
+	}
 	if cfg.HTTPClient == nil {
 		return nil, &coinwerr.ValidationError{
 			Message: "an HTTPClient is required (e.g. http.DefaultClient or a tuned *http.Client)",
@@ -61,8 +67,17 @@ func NewExecutor(cfg Config) (*Executor, error) {
 	if cfg.Clock == nil {
 		cfg.Clock = systemClock{}
 	}
+	if cfg.RetryBackoff == nil {
+		cfg.RetryBackoff = backoff
+	}
+	if cfg.RetrySleep == nil {
+		cfg.RetrySleep = sleepCtx
+	}
 	if cfg.MaxReadRetries < 0 {
 		cfg.MaxReadRetries = 0
+	}
+	if cfg.RequestTimeout < 0 {
+		return nil, &coinwerr.ValidationError{Message: "RequestTimeout must not be negative"}
 	}
 	return &Executor{cfg: cfg}, nil
 }
@@ -84,7 +99,7 @@ func (e *Executor) Execute(ctx context.Context, endpointID string, params interf
 	}
 
 	maxAttempts := 1
-	if ep.ReadOnly {
+	if ep.ReadOnly && ep.Method == http.MethodGet {
 		maxAttempts += e.cfg.MaxReadRetries
 	}
 
@@ -99,12 +114,7 @@ func (e *Executor) Execute(ctx context.Context, endpointID string, params interf
 			}
 		}
 
-		req, err := e.buildRequest(ctx, ep, params)
-		if err != nil {
-			return nil, err // signing/validation errors are not retryable
-		}
-
-		result, err := e.do(req, ep)
+		result, err := e.attempt(ctx, ep, params)
 		if err == nil {
 			return result, nil
 		}
@@ -113,22 +123,46 @@ func (e *Executor) Execute(ctx context.Context, endpointID string, params interf
 		if !retryable(ep, err) || attempt == maxAttempts {
 			return nil, err
 		}
-		if err := sleepCtx(ctx, backoff(attempt)); err != nil {
+		delay := e.cfg.RetryBackoff(attempt)
+		if delay < 0 {
+			delay = 0
+		}
+		if delay > 5*time.Second {
+			delay = 5 * time.Second
+		}
+		if err := e.cfg.RetrySleep(ctx, delay); err != nil {
 			return nil, err
 		}
 	}
 	return nil, lastErr
 }
 
+func (e *Executor) attempt(ctx context.Context, ep endpoints.Definition, params interface{}) (*Result, error) {
+	if e.cfg.RequestTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, e.cfg.RequestTimeout)
+		defer cancel()
+	}
+	req, err := e.buildRequest(ctx, ep, params)
+	if err != nil {
+		return nil, err
+	}
+	return e.do(req, ep)
+}
+
 func (e *Executor) do(req *http.Request, ep endpoints.Definition) (*Result, error) {
 	resp, err := e.cfg.HTTPClient.Do(req)
 	if err != nil {
-		return nil, &coinwerr.TransportError{Message: "http transport error", Err: err}
+		return nil, &coinwerr.TransportError{Message: "http transport error at " + ep.ID, Err: err}
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	const maxBody = 16 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return nil, &coinwerr.TransportError{Message: "failed to read response body", Err: err}
+	}
+	if len(body) > maxBody {
+		return nil, &coinwerr.ProtocolError{Message: "response body exceeds 16 MiB"}
 	}
 	return validateResponse(resp, body, ep)
 }
@@ -199,7 +233,7 @@ func (e *Executor) buildRequest(ctx context.Context, ep endpoints.Definition, pa
 		payload, hdr, err := auth.FuturesSignedBody(method, ep.Path, params,
 			e.cfg.FuturesAPIKey, e.cfg.FuturesSecretKey, ts)
 		if err != nil {
-			return nil, &coinwerr.ProtocolError{Message: "failed to encode futures body: " + err.Error()}
+			return nil, &coinwerr.SerializationError{Message: "failed to encode futures body", Err: err}
 		}
 		req, err := http.NewRequestWithContext(ctx, method, base+ep.Path, strings.NewReader(payload))
 		if err != nil {
@@ -236,7 +270,7 @@ func queryString(m map[string]interface{}) string {
 // read-only endpoints are ever retried; auth/validation/ambiguity/business
 // errors are never retried.
 func retryable(ep endpoints.Definition, err error) bool {
-	if ep.IsMutation() {
+	if ep.IsMutation() || ep.Method != http.MethodGet {
 		return false
 	}
 	switch err.(type) {

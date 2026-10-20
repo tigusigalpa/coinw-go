@@ -3,17 +3,17 @@ package services
 import (
 	"context"
 
+	"github.com/tigusigalpa/coinw-go/model"
 	"github.com/tigusigalpa/coinw-go/transport"
 )
 
 // FuturesOriginTypes are the documented originType values.
-var FuturesOriginTypes = []string{"plan", "planTrigger", "execute"}
+func FuturesOriginTypes() []string { return []string{"plan", "planTrigger", "execute"} }
 
 func validOriginType(v string) bool {
-	for _, t := range FuturesOriginTypes {
-		if t == v {
-			return true
-		}
+	switch v {
+	case PositionTypePlan, PositionTypePlanTrigger, PositionTypeExecute:
+		return true
 	}
 	return false
 }
@@ -30,7 +30,7 @@ func (s *FuturesCheckService) batchParams(symbols []string, originType string, p
 		return nil, err
 	}
 	if !validOriginType(originType) {
-		return nil, validationErr("originType must be one of: %v", FuturesOriginTypes)
+		return nil, validationErr("originType must be plan, planTrigger or execute")
 	}
 	params := map[string]interface{}{"symbols": csv(symbols), "originType": originType}
 	if page > 0 {
@@ -46,32 +46,32 @@ func (s *FuturesCheckService) batchParams(symbols []string, originType string, p
 }
 
 // GetBatchHistoricalOrders7Days — GET /v1/perpum/orders/batchInsHistory.
-func (s *FuturesCheckService) GetBatchHistoricalOrders7Days(ctx context.Context, symbols []string, originType string, page, pageSize int) (*transport.Result, error) {
+func (s *FuturesCheckService) GetBatchHistoricalOrders7Days(ctx context.Context, symbols []string, originType string, page, pageSize int) (*transport.Response[model.RowsPage[model.FuturesOrder]], error) {
 	p, err := s.batchParams(symbols, originType, page, pageSize)
 	if err != nil {
 		return nil, err
 	}
-	return s.call(ctx, "futures.check.getBatchHistoricalOrders7Days", p)
+	return callTyped[model.RowsPage[model.FuturesOrder]](s.base, ctx, "futures.check.getBatchHistoricalOrders7Days", p)
 }
 
 // GetBatchHistoricalOrders3Months — GET /v1/perpum/orders/batchInsArchive.
-func (s *FuturesCheckService) GetBatchHistoricalOrders3Months(ctx context.Context, symbols []string, originType string, page, pageSize int) (*transport.Result, error) {
+func (s *FuturesCheckService) GetBatchHistoricalOrders3Months(ctx context.Context, symbols []string, originType string, page, pageSize int) (*transport.Response[model.RowsPage[model.FuturesOrder]], error) {
 	p, err := s.batchParams(symbols, originType, page, pageSize)
 	if err != nil {
 		return nil, err
 	}
-	return s.call(ctx, "futures.check.getBatchHistoricalOrders3Months", p)
+	return callTyped[model.RowsPage[model.FuturesOrder]](s.base, ctx, "futures.check.getBatchHistoricalOrders3Months", p)
 }
 
 // GetCurrentOrders — GET /v1/perpum/orders/open.
-func (s *FuturesCheckService) GetCurrentOrders(ctx context.Context, instrument, positionType string) (*transport.Result, error) {
+func (s *FuturesCheckService) GetCurrentOrders(ctx context.Context, instrument, positionType string) (*transport.Response[model.RowsPage[model.FuturesOrder]], error) {
 	if _, err := requireNonEmpty(instrument, "instrument"); err != nil {
 		return nil, err
 	}
 	if _, err := requireNonEmpty(positionType, "positionType"); err != nil {
 		return nil, err
 	}
-	return s.call(ctx, "futures.check.getCurrentOrders", map[string]interface{}{
+	return callTyped[model.RowsPage[model.FuturesOrder]](s.base, ctx, "futures.check.getCurrentOrders", map[string]interface{}{
 		"instrument":   instrument,
 		"positionType": positionType,
 	})
@@ -79,12 +79,12 @@ func (s *FuturesCheckService) GetCurrentOrders(ctx context.Context, instrument, 
 
 // GetHistoricalOrders7Days — GET /v1/perpum/orders/history.
 // page/pageSize<1 omit; empty originType omits.
-func (s *FuturesCheckService) GetHistoricalOrders7Days(ctx context.Context, instrument string, page, pageSize int, originType string) (*transport.Result, error) {
+func (s *FuturesCheckService) GetHistoricalOrders7Days(ctx context.Context, instrument string, page, pageSize int, originType string) (*transport.Response[model.RowsPage[model.FuturesOrder]], error) {
 	if _, err := requireNonEmpty(instrument, "instrument"); err != nil {
 		return nil, err
 	}
 	if originType != "" && !validOriginType(originType) {
-		return nil, validationErr("originType must be one of: %v", FuturesOriginTypes)
+		return nil, validationErr("originType must be plan, planTrigger or execute")
 	}
 	params := map[string]interface{}{"instrument": instrument}
 	if page > 0 {
@@ -96,16 +96,16 @@ func (s *FuturesCheckService) GetHistoricalOrders7Days(ctx context.Context, inst
 	if originType != "" {
 		params["originType"] = originType
 	}
-	return s.call(ctx, "futures.check.getHistoricalOrders7Days", params)
+	return callTyped[model.RowsPage[model.FuturesOrder]](s.base, ctx, "futures.check.getHistoricalOrders7Days", params)
 }
 
 // GetHistoricalOrders3Months — GET /v1/perpum/orders/archive.
-func (s *FuturesCheckService) GetHistoricalOrders3Months(ctx context.Context, instrument string, page, pageSize int, originType string) (*transport.Result, error) {
+func (s *FuturesCheckService) GetHistoricalOrders3Months(ctx context.Context, instrument string, page, pageSize int, originType string) (*transport.Response[model.RowsPage[model.FuturesOrder]], error) {
 	if _, err := requireNonEmpty(instrument, "instrument"); err != nil {
 		return nil, err
 	}
 	if originType != "" && !validOriginType(originType) {
-		return nil, validationErr("originType must be one of: %v", FuturesOriginTypes)
+		return nil, validationErr("originType must be plan, planTrigger or execute")
 	}
 	params := map[string]interface{}{"instrument": instrument}
 	if page > 0 {
@@ -117,13 +117,13 @@ func (s *FuturesCheckService) GetHistoricalOrders3Months(ctx context.Context, in
 	if originType != "" {
 		params["originType"] = originType
 	}
-	return s.call(ctx, "futures.check.getHistoricalOrders3Months", params)
+	return callTyped[model.RowsPage[model.FuturesOrder]](s.base, ctx, "futures.check.getHistoricalOrders3Months", params)
 }
 
 // GetOrderInformation — GET /v1/perpum/order.
 // sourceIds: documented list of order ids (sent as JSON array in query? —
 // the documented field is a comma list; pass []string, encoded CSV).
-func (s *FuturesCheckService) GetOrderInformation(ctx context.Context, positionType string, sourceIDs []string, instrument string) (*transport.Result, error) {
+func (s *FuturesCheckService) GetOrderInformation(ctx context.Context, positionType string, sourceIDs []string, instrument string) (*transport.Response[[]model.FuturesOrder], error) {
 	if _, err := requireNonEmpty(positionType, "positionType"); err != nil {
 		return nil, err
 	}
@@ -134,12 +134,12 @@ func (s *FuturesCheckService) GetOrderInformation(ctx context.Context, positionT
 	if instrument != "" {
 		params["instrument"] = instrument
 	}
-	return s.call(ctx, "futures.check.getOrderInformation", params)
+	return callTyped[[]model.FuturesOrder](s.base, ctx, "futures.check.getOrderInformation", params)
 }
 
 // GetPendingOrderCount — GET /v1/perpum/orders/openQuantity.
-func (s *FuturesCheckService) GetPendingOrderCount(ctx context.Context) (*transport.Result, error) {
-	return s.call(ctx, "futures.check.getPendingOrderCount", nil)
+func (s *FuturesCheckService) GetPendingOrderCount(ctx context.Context) (*transport.Response[model.ValueOrScalar[model.StringOrInteger]], error) {
+	return callTyped[model.ValueOrScalar[model.StringOrInteger]](s.base, ctx, "futures.check.getPendingOrderCount", nil)
 }
 
 // SLTPQuery carries the documented optional SL/TP lookup fields.
@@ -152,7 +152,7 @@ type SLTPQuery struct {
 }
 
 // GetStopLossTakeProfitInformation — GET /v1/perpum/TPSL.
-func (s *FuturesCheckService) GetStopLossTakeProfitInformation(ctx context.Context, q SLTPQuery) (*transport.Result, error) {
+func (s *FuturesCheckService) GetStopLossTakeProfitInformation(ctx context.Context, q SLTPQuery) (*transport.Response[[]model.StopLossTakeProfit], error) {
 	params := map[string]interface{}{}
 	if q.StopFrom != 0 {
 		params["stopFrom"] = q.StopFrom
@@ -169,10 +169,10 @@ func (s *FuturesCheckService) GetStopLossTakeProfitInformation(ctx context.Conte
 	if q.Instrument != "" {
 		params["instrument"] = q.Instrument
 	}
-	return s.call(ctx, "futures.check.getStopLossTakeProfitInformation", params)
+	return callTyped[[]model.StopLossTakeProfit](s.base, ctx, "futures.check.getStopLossTakeProfitInformation", params)
 }
 
 // GetTrailingStopLossTakeProfitInformation — GET /v1/perpum/moveTPSL.
-func (s *FuturesCheckService) GetTrailingStopLossTakeProfitInformation(ctx context.Context) (*transport.Result, error) {
-	return s.call(ctx, "futures.check.getTrailingStopLossTakeProfitInformation", nil)
+func (s *FuturesCheckService) GetTrailingStopLossTakeProfitInformation(ctx context.Context) (*transport.Response[[]model.TrailingStopLossTakeProfit], error) {
+	return callTyped[[]model.TrailingStopLossTakeProfit](s.base, ctx, "futures.check.getTrailingStopLossTakeProfitInformation", nil)
 }

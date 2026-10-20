@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -126,6 +127,7 @@ func TestRawJsonPrivateLoginRejected(t *testing.T) {
 func TestSocketIOSession(t *testing.T) {
 	conn := &fakeConn{incoming: [][]byte{
 		[]byte(`0{"sid":"abc"}`),
+		[]byte(`40{"sid":"namespace"}`),
 		[]byte(`2`),
 		[]byte(`42["subscribe",{"args":"spot/match:BTC-USDT","success":true}]`),
 	}}
@@ -137,7 +139,8 @@ func TestSocketIOSession(t *testing.T) {
 	if err := s.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if d.urls[0] != "wss://ws.futurescw.info?token=TOK" {
+	u, _ := url.Parse(d.urls[0])
+	if u.Path != "/socket.io/" || u.Query().Get("token") != "TOK" || u.Query().Get("EIO") != "4" || u.Query().Get("transport") != "websocket" {
 		t.Fatalf("bad url: %s", d.urls[0])
 	}
 	if err := s.Subscribe("spot/match:BTC-USDT"); err != nil {
@@ -147,10 +150,7 @@ func TestSocketIOSession(t *testing.T) {
 	if last != `42["subscribe",{"args":"spot/match:BTC-USDT"}]` {
 		t.Fatalf("bad subscribe frame: %s", last)
 	}
-	// '0' open → client sends "40"
-	if _, err := s.ReadMessage(); err != nil {
-		t.Fatal(err)
-	}
+	// Connect completed '0' → '40' before sending subscriptions.
 	found40 := false
 	for _, f := range conn.sent {
 		if string(f) == "40" {
@@ -181,9 +181,10 @@ func TestDepthSequenceTracker(t *testing.T) {
 	tr := &DepthSequenceTracker{}
 	i64 := func(v int64) *int64 { return &v }
 
-	if r := tr.Track(i64(100), i64(110)); r != DepthApplied {
-		t.Fatalf("first event anchors: %v", r)
+	if r := tr.Track(i64(100), i64(110)); r != DepthNeedsSnapshot {
+		t.Fatalf("unanchored event must request a snapshot: %v", r)
 	}
+	tr.Reset(110)
 	if r := tr.Track(i64(111), i64(120)); r != DepthApplied {
 		t.Fatalf("sequential apply: %v", r)
 	}

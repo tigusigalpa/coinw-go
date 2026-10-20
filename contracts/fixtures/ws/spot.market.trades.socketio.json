@@ -1,0 +1,1 @@
+{"channel":"spot/match:BTC-USDT","subject":"spot/match","data":"[{\n\"price\":\"82861.81\",\n\"seq\":\"127365683\",\n\"side\":\"SELL\",\n\"size\":\"0.0004\",\n\"symbol\":\"78\",\n\"time\":\"1741944585776\"\n}]"}

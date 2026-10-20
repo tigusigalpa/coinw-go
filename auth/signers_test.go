@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -18,6 +19,27 @@ func TestSpotCanonicalString(t *testing.T) {
 	want := "api_key=TEST_API_KEY&instrument=BTC_USDT&price=100.5&quantity=1&secret_key=TEST_SECRET"
 	if got != want {
 		t.Fatalf("canonical mismatch:\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestFuturesQueryEscaping(t *testing.T) {
+	params := map[string]interface{}{"startTime": "2026-10-20 00:00:00", "referralCode": "a&b+c#d?e=ж"}
+	query, headers := FuturesSignedGet("/test", params, "K", "S", 123)
+	decoded, err := url.ParseQuery(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range params {
+		if decoded.Get(k) != v {
+			t.Fatalf("%s did not round trip: %s", k, query)
+		}
+	}
+	mac := hmac.New(sha256.New, []byte("S"))
+	// The official Python snippet signs unescaped pairs, then requests.get
+	// escapes the wire query. Spaces and delimiters must follow that contract.
+	mac.Write([]byte("123GET/test?referralCode=a&b+c#d?e=ж&startTime=2026-10-20 00:00:00"))
+	if headers.Sign != base64.StdEncoding.EncodeToString(mac.Sum(nil)) {
+		t.Fatal("signature must match the official unescaped canonical query")
 	}
 }
 

@@ -2,9 +2,9 @@ package services
 
 import (
 	"context"
-	"sort"
 
 	coinwerr "github.com/tigusigalpa/coinw-go/errors"
+	"github.com/tigusigalpa/coinw-go/model"
 	"github.com/tigusigalpa/coinw-go/transport"
 )
 
@@ -20,22 +20,22 @@ func NewSpotMarketService(ex *transport.Executor) *SpotMarketService {
 }
 
 // GetInstrumentInformation — command=returnSymbol.
-func (s *SpotMarketService) GetInstrumentInformation(ctx context.Context) (*transport.Result, error) {
-	return s.call(ctx, "spot.market.getInstrumentInformation", nil)
+func (s *SpotMarketService) GetInstrumentInformation(ctx context.Context) (*transport.Response[[]model.SpotInstrument], error) {
+	return callTyped[[]model.SpotInstrument](s.base, ctx, "spot.market.getInstrumentInformation", nil)
 }
 
 // Get24hTradeSummaryForAllInstruments — command=returnTicker.
-func (s *SpotMarketService) Get24hTradeSummaryForAllInstruments(ctx context.Context) (*transport.Result, error) {
-	return s.call(ctx, "spot.market.get24hTradeSummaryForAllInstruments", nil)
+func (s *SpotMarketService) Get24hTradeSummaryForAllInstruments(ctx context.Context) (*transport.Response[map[string]model.SpotTicker], error) {
+	return callTyped[map[string]model.SpotTicker](s.base, ctx, "spot.market.get24hTradeSummaryForAllInstruments", nil)
 }
 
 // GetCoinDepositWithdrawalLimits — command=returnCurrencies.
-func (s *SpotMarketService) GetCoinDepositWithdrawalLimits(ctx context.Context) (*transport.Result, error) {
-	return s.call(ctx, "spot.market.getCoinDepositWithdrawalLimits", nil)
+func (s *SpotMarketService) GetCoinDepositWithdrawalLimits(ctx context.Context) (*transport.Response[map[string]model.SpotCurrency], error) {
+	return callTyped[map[string]model.SpotCurrency](s.base, ctx, "spot.market.getCoinDepositWithdrawalLimits", nil)
 }
 
 // GetOrderBook — command=returnOrderBook. size=0 omits the documented size.
-func (s *SpotMarketService) GetOrderBook(ctx context.Context, symbol string, size int) (*transport.Result, error) {
+func (s *SpotMarketService) GetOrderBook(ctx context.Context, symbol string, size int) (*transport.Response[[]model.SpotOrderBook], error) {
 	if _, err := requireNonEmpty(symbol, "symbol"); err != nil {
 		return nil, err
 	}
@@ -43,12 +43,12 @@ func (s *SpotMarketService) GetOrderBook(ctx context.Context, symbol string, siz
 	if size > 0 {
 		params["size"] = size
 	}
-	return s.call(ctx, "spot.market.getOrderBook", params)
+	return callTyped[[]model.SpotOrderBook](s.base, ctx, "spot.market.getOrderBook", params)
 }
 
 // GetRecentTrades — command=returnTradeHistory. end=0 omits the documented
 // end timestamp (ms).
-func (s *SpotMarketService) GetRecentTrades(ctx context.Context, symbol string, end int64) (*transport.Result, error) {
+func (s *SpotMarketService) GetRecentTrades(ctx context.Context, symbol string, end int64) (*transport.Response[[]model.SpotTrade], error) {
 	if _, err := requireNonEmpty(symbol, "symbol"); err != nil {
 		return nil, err
 	}
@@ -56,22 +56,22 @@ func (s *SpotMarketService) GetRecentTrades(ctx context.Context, symbol string, 
 	if end != 0 {
 		params["end"] = end
 	}
-	return s.call(ctx, "spot.market.getRecentTrades", params)
+	return callTyped[[]model.SpotTrade](s.base, ctx, "spot.market.getRecentTrades", params)
 }
 
 // SpotKLinePeriods are the documented K-line intervals in SECONDS.
 // The doc page's hyperlink example shows period=30, contradicting the table —
 // the SDK enforces the table contract and does not rewrite the value.
-var SpotKLinePeriods = []int{60, 180, 300, 900, 1800, 7200, 14400}
+func SpotKLinePeriods() []int { return []int{60, 180, 300, 900, 1800, 7200, 14400} }
 
 // GetKLine — command=returnChartData.
 // currencyPairs: e.g. ["BTC_USDT","ETH_USDT"], max 20. period must be one of
 // SpotKLinePeriods. start/end are documented ms timestamps; 0 omits them.
-func (s *SpotMarketService) GetKLine(ctx context.Context, currencyPairs []string, period int, start, end int64) (*transport.Result, error) {
-	ok := sort.SearchInts(SpotKLinePeriods, period) < len(SpotKLinePeriods) &&
-		SpotKLinePeriods[sort.SearchInts(SpotKLinePeriods, period)] == period
-	if !ok {
-		return nil, validationErr("period must be one of the documented K-line intervals (seconds): %v", SpotKLinePeriods)
+func (s *SpotMarketService) GetKLine(ctx context.Context, currencyPairs []string, period int, start, end int64) (*transport.Response[[]model.SpotCandle], error) {
+	switch period {
+	case 60, 180, 300, 900, 1800, 7200, 14400:
+	default:
+		return nil, validationErr("period must be a documented K-line interval (seconds): 60, 180, 300, 900, 1800, 7200, 14400")
 	}
 	if _, err := requireMaxInstruments(currencyPairs, 20); err != nil {
 		return nil, err
@@ -86,12 +86,12 @@ func (s *SpotMarketService) GetKLine(ctx context.Context, currencyPairs []string
 	if end != 0 {
 		params["end"] = end
 	}
-	return s.call(ctx, "spot.market.getKLine", params)
+	return callTyped[[]model.SpotCandle](s.base, ctx, "spot.market.getKLine", params)
 }
 
 // Get24hVolumeForPopularInstruments — command=return24hVolume.
-func (s *SpotMarketService) Get24hVolumeForPopularInstruments(ctx context.Context) (*transport.Result, error) {
-	return s.call(ctx, "spot.market.get24hVolumeForPopularInstruments", nil)
+func (s *SpotMarketService) Get24hVolumeForPopularInstruments(ctx context.Context) (*transport.Response[model.PopularVolumes], error) {
+	return callTyped[model.PopularVolumes](s.base, ctx, "spot.market.get24hVolumeForPopularInstruments", nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -106,13 +106,13 @@ func NewSpotAccountService(ex *transport.Executor) *SpotAccountService {
 }
 
 // GetSpotAccountBalance — command=returnBalances.
-func (s *SpotAccountService) GetSpotAccountBalance(ctx context.Context) (*transport.Result, error) {
-	return s.call(ctx, "spot.account.getSpotAccountBalance", nil)
+func (s *SpotAccountService) GetSpotAccountBalance(ctx context.Context) (*transport.Response[map[string]model.WireDecimal], error) {
+	return callTyped[map[string]model.WireDecimal](s.base, ctx, "spot.account.getSpotAccountBalance", nil)
 }
 
 // GetFullSpotAccountBalance — command=returnCompleteBalances.
-func (s *SpotAccountService) GetFullSpotAccountBalance(ctx context.Context) (*transport.Result, error) {
-	return s.call(ctx, "spot.account.getFullSpotAccountBalance", nil)
+func (s *SpotAccountService) GetFullSpotAccountBalance(ctx context.Context) (*transport.Response[map[string]model.SpotFullBalance], error) {
+	return callTyped[map[string]model.SpotFullBalance](s.base, ctx, "spot.account.getFullSpotAccountBalance", nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -132,7 +132,7 @@ func NewSpotCheckService(ex *transport.Executor) *SpotCheckService {
 // spot private route; host/path is unverified. Returns
 // AmbiguousDocumentationError until resolved. orderIds must contain 1..50
 // entries.
-func (s *SpotCheckService) GetBatchHistoricalOrders(ctx context.Context, orderIDs []string) (*transport.Result, error) {
+func (s *SpotCheckService) GetBatchHistoricalOrders(ctx context.Context, orderIDs []string) (*transport.Response[model.ObjectOrArray[model.SpotBatchHistoricalOrder]], error) {
 	if len(orderIDs) == 0 || len(orderIDs) > 50 {
 		return nil, validationErr("orderIds must contain 1..50 entries")
 	}
@@ -144,36 +144,36 @@ func (s *SpotCheckService) GetBatchHistoricalOrders(ctx context.Context, orderID
 }
 
 // GetCurrentOrders — command=returnOpenOrders. Empty currencyPair lists all.
-func (s *SpotCheckService) GetCurrentOrders(ctx context.Context, currencyPair string) (*transport.Result, error) {
-	return s.call(ctx, "spot.check.getCurrentOrders", nonNull(map[string]interface{}{
+func (s *SpotCheckService) GetCurrentOrders(ctx context.Context, currencyPair string) (*transport.Response[[]model.SpotCurrentOrder], error) {
+	return callTyped[[]model.SpotCurrentOrder](s.base, ctx, "spot.check.getCurrentOrders", nonNull(map[string]interface{}{
 		"currencyPair": emptyToNil(currencyPair),
 	}))
 }
 
 // GetHistoricalOrders — command=getUserTrades.
-func (s *SpotCheckService) GetHistoricalOrders(ctx context.Context, symbol string) (*transport.Result, error) {
-	return s.call(ctx, "spot.check.getHistoricalOrders", nonNull(map[string]interface{}{
+func (s *SpotCheckService) GetHistoricalOrders(ctx context.Context, symbol string) (*transport.Response[model.SpotHistoryPage], error) {
+	return callTyped[model.SpotHistoryPage](s.base, ctx, "spot.check.getHistoricalOrders", nonNull(map[string]interface{}{
 		"symbol": emptyToNil(symbol),
 	}))
 }
 
 // GetOrderDetails — command=returnOrderTrades.
-func (s *SpotCheckService) GetOrderDetails(ctx context.Context, orderID string) (*transport.Result, error) {
-	return s.call(ctx, "spot.check.getOrderDetails", nonNull(map[string]interface{}{
-		"orderId": emptyToNil(orderID),
+func (s *SpotCheckService) GetOrderDetails(ctx context.Context, orderID string) (*transport.Response[model.SpotOrderDetails], error) {
+	return callTyped[model.SpotOrderDetails](s.base, ctx, "spot.check.getOrderDetails", nonNull(map[string]interface{}{
+		"orderNumber": emptyToNil(orderID),
 	}))
 }
 
 // GetOrderStatus — command=returnOrderStatus.
-func (s *SpotCheckService) GetOrderStatus(ctx context.Context, orderID string) (*transport.Result, error) {
-	return s.call(ctx, "spot.check.getOrderStatus", nonNull(map[string]interface{}{
-		"orderId": emptyToNil(orderID),
+func (s *SpotCheckService) GetOrderStatus(ctx context.Context, orderID string) (*transport.Response[model.SpotOrderStatus], error) {
+	return callTyped[model.SpotOrderStatus](s.base, ctx, "spot.check.getOrderStatus", nonNull(map[string]interface{}{
+		"orderNumber": emptyToNil(orderID),
 	}))
 }
 
 // GetTransactionHistory — command=returnUTradeHistory.
-func (s *SpotCheckService) GetTransactionHistory(ctx context.Context, currencyPair string) (*transport.Result, error) {
-	return s.call(ctx, "spot.check.getTransactionHistory", nonNull(map[string]interface{}{
+func (s *SpotCheckService) GetTransactionHistory(ctx context.Context, currencyPair string) (*transport.Response[[]model.SpotTransaction], error) {
+	return callTyped[[]model.SpotTransaction](s.base, ctx, "spot.check.getTransactionHistory", nonNull(map[string]interface{}{
 		"currencyPair": emptyToNil(currencyPair),
 	}))
 }
@@ -207,7 +207,7 @@ func NewSpotTradeService(ex *transport.Executor) *SpotTradeService {
 // PlaceOrder — command=doTrade. MUTATION.
 // symbol e.g. "BTC_USDT"; typ is SpotSideBuy (0) or SpotSideSell (1);
 // amount is a decimal string.
-func (s *SpotTradeService) PlaceOrder(ctx context.Context, symbol string, typ int, amount string, opts SpotOrderOptions) (*transport.Result, error) {
+func (s *SpotTradeService) PlaceOrder(ctx context.Context, symbol string, typ int, amount string, opts SpotOrderOptions) (*transport.Response[model.SpotOrderAcknowledgement], error) {
 	if typ != SpotSideBuy && typ != SpotSideSell {
 		return nil, validationErr("type must be 0 (buy) or 1 (sell)")
 	}
@@ -240,21 +240,24 @@ func (s *SpotTradeService) PlaceOrder(ctx context.Context, symbol string, typ in
 		}
 		params["funds"] = opts.Funds
 	}
-	return s.call(ctx, "spot.trade.placeOrder", params)
+	return callTyped[model.SpotOrderAcknowledgement](s.base, ctx, "spot.trade.placeOrder", params)
 }
 
 // CancelOrder — command=cancelOrder. MUTATION.
-func (s *SpotTradeService) CancelOrder(ctx context.Context, orderID string) (*transport.Result, error) {
-	return s.call(ctx, "spot.trade.cancelOrder", nonNull(map[string]interface{}{
-		"orderId": emptyToNil(orderID),
+func (s *SpotTradeService) CancelOrder(ctx context.Context, orderID string) (*transport.Response[model.SpotCancelAcknowledgement], error) {
+	return callTyped[model.SpotCancelAcknowledgement](s.base, ctx, "spot.trade.cancelOrder", nonNull(map[string]interface{}{
+		"orderNumber": emptyToNil(orderID),
 	}))
 }
 
 // CancelAllOrders — command=cancelAllOrder. MUTATION.
-// currencyPair is sent only when provided; the SDK does not widen the
-// documented semantics to "all markets" on its own.
-func (s *SpotTradeService) CancelAllOrders(ctx context.Context, currencyPair string) (*transport.Result, error) {
-	return s.call(ctx, "spot.trade.cancelAllOrders", nonNull(map[string]interface{}{
+// The table marks currencyPair optional, but the description only promises a
+// specified instrument. An empty filter is gated until its scope is confirmed.
+func (s *SpotTradeService) CancelAllOrders(ctx context.Context, currencyPair string) (*transport.Response[model.NoData], error) {
+	if _, err := requireNonEmpty(currencyPair, "currencyPair"); err != nil {
+		return nil, &coinwerr.AmbiguousDocumentationError{EndpointID: "spot.trade.cancelAllOrders", Note: "currencyPair is optional in the table, but cancellation is described only for a specified instrument; unfiltered scope is unverified"}
+	}
+	return callTyped[model.NoData](s.base, ctx, "spot.trade.cancelAllOrders", nonNull(map[string]interface{}{
 		"currencyPair": emptyToNil(currencyPair),
 	}))
 }

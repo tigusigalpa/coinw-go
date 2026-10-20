@@ -13,6 +13,7 @@ package ratelimit
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 
@@ -43,7 +44,7 @@ func (b *bucket) waitDuration(now time.Time) time.Duration {
 		return 0
 	}
 	missing := 1.0 - b.tokens
-	return time.Duration(missing / b.rate * float64(time.Second))
+	return time.Duration(math.Ceil(missing / b.rate * float64(time.Second)))
 }
 
 func (b *bucket) refill(now time.Time) {
@@ -154,9 +155,8 @@ func (l *InMemoryLimiter) bucketsFor(ep endpoints.Definition, uid string) []*buc
 	case endpoints.GroupFuturesA:
 		specs = append(specs, spec{"futuresA:ip", 30})
 	case endpoints.GroupFuturesB:
-		if uid != "" {
-			specs = append(specs, spec{"futuresB:uid:" + uid, 100})
-		}
+		// An unspecified UID still needs a shared budget for this client.
+		specs = append(specs, spec{"futuresB:uid:" + uid, 100})
 	case endpoints.GroupAffiliate:
 		specs = append(specs, spec{"affiliate:ip", 5})
 		if uid != "" {
@@ -164,19 +164,22 @@ func (l *InMemoryLimiter) bucketsFor(ep endpoints.Definition, uid string) []*buc
 		}
 	}
 
-	if ep.PerInterfaceRPS > 0 {
-		scope := "ip"
-		if uid != "" {
-			scope = "uid:" + uid
-		}
-		specs = append(specs, spec{"iface:" + ep.ID + ":" + scope, ep.PerInterfaceRPS})
+	ipRate, uidRate := ep.PerIPRPS, ep.PerUIDRPS
+	if ipRate == 0 && uidRate == 0 {
+		ipRate, uidRate = ep.PerInterfaceRPS, ep.PerInterfaceRPS
+	}
+	if ipRate > 0 {
+		specs = append(specs, spec{"iface:" + ep.ID + ":ip", ipRate})
+	}
+	if uidRate > 0 {
+		specs = append(specs, spec{"iface:" + ep.ID + ":uid:" + uid, uidRate})
 	}
 
 	out := make([]*bucket, 0, len(specs))
 	for _, s := range specs {
 		b, ok := l.buckets[s.key]
 		if !ok {
-			b = newBucket(s.rps, s.rps, now)
+			b = newBucket(math.Max(1, s.rps), s.rps, now)
 			l.buckets[s.key] = b
 		}
 		out = append(out, b)

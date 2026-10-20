@@ -6,8 +6,10 @@
 package errors
 
 import (
+	stderrors "errors"
 	"fmt"
-	"strings"
+	"net/url"
+	"regexp"
 )
 
 // ValidationError — client-side input rejected before any network call.
@@ -15,7 +17,16 @@ type ValidationError struct {
 	Message string
 }
 
-func (e *ValidationError) Error() string { return e.Message }
+func (e *ValidationError) Error() string { return Redact(e.Message) }
+
+// SerializationError is a request encoding failure before network I/O.
+type SerializationError struct {
+	Message string
+	Err     error
+}
+
+func (e *SerializationError) Error() string { return Redact(e.Message) }
+func (e *SerializationError) Unwrap() error { return e.Err }
 
 // AuthenticationError — missing/invalid credentials or a documented auth
 // business code (6000/6001/6003/-103/1004).
@@ -23,7 +34,7 @@ type AuthenticationError struct {
 	Message string
 }
 
-func (e *AuthenticationError) Error() string { return e.Message }
+func (e *AuthenticationError) Error() string { return Redact(e.Message) }
 
 // RateLimitError — HTTP 429 or documented code 29001.
 type RateLimitError struct {
@@ -32,7 +43,7 @@ type RateLimitError struct {
 }
 
 func (e *RateLimitError) Error() string {
-	return fmt.Sprintf("coinw rate limit (%s): %s", e.Code, e.Message)
+	return Redact(fmt.Sprintf("coinw rate limit (%s): %s", e.Code, e.Message))
 }
 
 // HTTPStatusError — non-2xx transport status.
@@ -42,7 +53,7 @@ type HTTPStatusError struct {
 }
 
 func (e *HTTPStatusError) Error() string {
-	return fmt.Sprintf("coinw http %d: %s", e.StatusCode, e.Message)
+	return Redact(fmt.Sprintf("coinw http %d: %s", e.StatusCode, e.Message))
 }
 
 // APIError — business-level failure code returned by the API envelope.
@@ -53,7 +64,7 @@ type APIError struct {
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("coinw api error %s at %s: %s", e.Code, e.EndpointID, e.Message)
+	return Redact(fmt.Sprintf("coinw api error %s at %s: %s", e.Code, e.EndpointID, e.Message))
 }
 
 // ProtocolError — malformed JSON envelope / WebSocket frame.
@@ -61,7 +72,7 @@ type ProtocolError struct {
 	Message string
 }
 
-func (e *ProtocolError) Error() string { return e.Message }
+func (e *ProtocolError) Error() string { return Redact(e.Message) }
 
 // TransportError — connection/DNS/TLS/body-read failures and timeouts.
 type TransportError struct {
@@ -71,9 +82,15 @@ type TransportError struct {
 
 func (e *TransportError) Error() string {
 	if e.Err != nil {
-		return e.Message + ": " + e.Err.Error()
+		// Spot URLs also contain private order/withdrawal parameters. Omit the
+		// complete URL, while retaining the original cause through Unwrap.
+		var requestErr *url.Error
+		if stderrors.As(e.Err, &requestErr) && requestErr.Err != nil {
+			return Redact(e.Message + ": " + requestErr.Op + ": " + requestErr.Err.Error())
+		}
+		return Redact(e.Message + ": " + e.Err.Error())
 	}
-	return e.Message
+	return Redact(e.Message)
 }
 
 func (e *TransportError) Unwrap() error { return e.Err }
@@ -85,7 +102,7 @@ type CancelledError struct {
 	Message string
 }
 
-func (e *CancelledError) Error() string { return e.Message }
+func (e *CancelledError) Error() string { return Redact(e.Message) }
 
 // AmbiguousDocumentationError — the endpoint is registered but the official
 // documentation contradicts itself, so no request is sent until verified.
@@ -95,31 +112,24 @@ type AmbiguousDocumentationError struct {
 }
 
 func (e *AmbiguousDocumentationError) Error() string {
-	return fmt.Sprintf("coinw endpoint %s blocked by conflicting documentation: %s",
-		e.EndpointID, e.Note)
+	return Redact(fmt.Sprintf("coinw endpoint %s blocked by conflicting documentation: %s",
+		e.EndpointID, e.Note))
 }
+
+const secretKeys = `(?:api_key|secret_key|passphrase|sign|signature|secretKey|apiKey|secret|authorization|token|subAccount_apiKey)`
+
+var (
+	jsonSecrets   = regexp.MustCompile(`(?i)("` + secretKeys + `"\s*:\s*)("(?:\\.|[^"\\])*"|[^,}\s]+)`)
+	querySecrets  = regexp.MustCompile(`(?i)(\b` + secretKeys + `=)[^&\s"'<>]*`)
+	headerSecrets = regexp.MustCompile(`(?im)(\b` + secretKeys + `\s*:\s*)[^\r\n,}]+`)
+)
 
 // Redact strips credential/signature values from a string before it reaches
 // logs or error messages.
 func Redact(s string) string {
-	for _, key := range []string{
-		"api_key", "secret_key", "passphrase", "sign", "signature",
-		"secretKey", "apiKey", "secret", "authorization", "token",
-	} {
-		for _, marker := range []string{key + "=", `"` + key + `":"`} {
-			for {
-				idx := strings.Index(s, marker)
-				if idx < 0 {
-					break
-				}
-				start := idx + len(marker)
-				end := start
-				for end < len(s) && !strings.ContainsRune("&\"' \t\n", rune(s[end])) {
-					end++
-				}
-				s = s[:start] + "***" + s[end:]
-			}
-		}
-	}
+	// Each pass moves forward through the input, including already redacted values.
+	s = jsonSecrets.ReplaceAllString(s, `${1}"***"`)
+	s = querySecrets.ReplaceAllString(s, `${1}***`)
+	s = headerSecrets.ReplaceAllString(s, `${1}***`)
 	return s
 }
