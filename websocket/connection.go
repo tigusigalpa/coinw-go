@@ -18,6 +18,8 @@ type sessionConn struct {
 	closeOnce sync.Once
 	done      chan struct{}
 	closeErr  error
+	hookOnce  sync.Once
+	hookErr   error
 }
 
 func newSessionConn(ctx context.Context, conn Conn) *sessionConn {
@@ -41,6 +43,16 @@ func (c *sessionConn) active() bool {
 	default:
 		return true
 	}
+}
+
+// prepare runs the per-connection hook once, before the first read. Frames
+// that arrive while it runs wait in the socket, so none are lost.
+func (c *sessionConn) prepare(hook func(context.Context) error) error {
+	if hook == nil {
+		return nil
+	}
+	c.hookOnce.Do(func() { c.hookErr = hook(c.ctx) })
+	return c.hookErr
 }
 
 func (c *sessionConn) WriteMessage(mt int, data []byte) error {

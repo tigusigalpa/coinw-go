@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -210,14 +211,17 @@ type RawJsonSession struct {
 	conn      *sessionConn
 	subs      map[string]subscription
 	auth      bool
+	stopRun   func()
 }
 
 // RawOption customises a session.
 type RawOption func(*RawJsonSession)
 
-// WithOnConnect runs a synchronous hook after authentication on every connect,
-// before Run restores subscriptions. Use it to fetch the matching private REST
-// snapshot; returning an error closes this connection and prevents event delivery.
+// WithOnConnect runs a synchronous hook once per connection, after login and
+// after the registered subscriptions are sent, before the first frame is read.
+// Use it to fetch the matching private REST snapshot: events pushed while it
+// runs wait in the socket, so none fall between the snapshot and the stream.
+// Returning an error closes this connection and prevents event delivery.
 func WithOnConnect(hook func(context.Context) error) RawOption {
 	return func(s *RawJsonSession) { s.onConnect = hook }
 }
@@ -319,16 +323,23 @@ func (s *RawJsonSession) Connect(ctx context.Context) error {
 			return err
 		}
 	}
-	if s.onConnect != nil {
-		if err := s.onConnect(ctx); err != nil {
-			return err
-		}
-	}
+	// Publishing the connection and copying the desired set in one step means
+	// a concurrent Subscribe is either restored here or sends its own frame.
 	s.mu.Lock()
 	s.conn = c
 	s.auth = s.private
+	frames := make([][]byte, 0, len(s.subs))
+	for _, sub := range s.subs {
+		frames = append(frames, sub.frame)
+	}
 	s.mu.Unlock()
 	succeeded = true
+	for _, frame := range frames {
+		if err := c.WriteMessage(websocket.TextMessage, frame); err != nil {
+			s.dropConnIf(c)
+			return &coinwerr.TransportError{Message: "resubscribe send failed", Err: err}
+		}
+	}
 	return nil
 }
 
@@ -367,63 +378,74 @@ func (s *RawJsonSession) awaitLoginAck(ctx context.Context, conn *sessionConn) e
 	return &coinwerr.TransportError{Message: "timed out waiting for WS login ack"}
 }
 
-// Subscribe registers and sends a sub frame. Params per docs:
-// biz + type (+ pairCode / interval when the channel requires them).
+// Subscribe adds params to the desired set and sends a sub frame when
+// connected. Params per docs: biz + type (+ pairCode / interval when the
+// channel requires them). The desired set is restored on every connect, so a
+// subscription made while disconnected is sent by the next Connect, and one
+// whose send fails stays registered for that restore.
 func (s *RawJsonSession) Subscribe(params map[string]interface{}) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.conn == nil {
-		return &coinwerr.TransportError{Message: "websocket is not connected — call Connect first"}
-	}
 	frame, err := frameJSON("sub", params)
 	if err != nil {
 		return err
 	}
-	if err := s.conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+	s.mu.Lock()
+	// The encoded frame is an immutable snapshot, including nested params.
+	s.subs[subKey(params)] = subscription{frame: frame}
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
+		return nil
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
 		return &coinwerr.TransportError{Message: "subscribe send failed", Err: err}
 	}
-	// The encoded frame is an immutable snapshot, including nested params.
-	key := subKey(params)
-	s.subs[key] = subscription{frame: frame}
 	return nil
 }
 
-// Unsubscribe removes the registration and sends an unsub frame.
+// Unsubscribe removes params from the desired set and sends an unsub frame
+// when connected. A removed subscription is never restored by a reconnect.
 func (s *RawJsonSession) Unsubscribe(params map[string]interface{}) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.conn == nil {
-		return &coinwerr.TransportError{Message: "websocket is not connected"}
-	}
 	frame, err := frameJSON("unsub", params)
 	if err != nil {
 		return err
 	}
-	if err := s.conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+	s.mu.Lock()
+	delete(s.subs, subKey(params))
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
+		return nil
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
 		return &coinwerr.TransportError{Message: "unsubscribe send failed", Err: err}
 	}
-	delete(s.subs, subKey(params))
 	return nil
 }
 
 // Ping sends the documented {"event":"ping"} keepalive.
 func (s *RawJsonSession) Ping() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.conn == nil {
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
 		return &coinwerr.TransportError{Message: "websocket is not connected"}
 	}
-	return s.conn.WriteMessage(websocket.TextMessage, []byte(`{"event":"ping"}`))
+	return conn.WriteMessage(websocket.TextMessage, []byte(`{"event":"ping"}`))
 }
 
-// ReadMessage reads and decodes the next frame. A read timeout is fatal to
-// the connection and is returned so Run can reconnect.
+// ReadMessage reads and decodes the next frame. The first read on a
+// connection runs the WithOnConnect hook. A read timeout is fatal to the
+// connection and is returned so Run can reconnect.
 func (s *RawJsonSession) ReadMessage() (*Message, error) {
 	s.mu.Lock()
 	conn := s.conn
 	s.mu.Unlock()
 	if conn == nil {
 		return nil, &coinwerr.TransportError{Message: "websocket is not connected"}
+	}
+	if err := conn.prepare(s.onConnect); err != nil {
+		s.dropConnIf(conn)
+		return nil, err
 	}
 	mt, raw, err := conn.read(s.readTimeout)
 	if err != nil {
@@ -437,27 +459,45 @@ func (s *RawJsonSession) ReadMessage() (*Message, error) {
 
 // Run is the blocking event loop: ping keepalive, bounded-backoff
 // reconnect, re-login and automatic resubscribe of the registered set.
-// onEvent receives every decoded frame except pong. Run returns when ctx is
-// cancelled or a fatal error escapes onError (return false to stop).
+// onEvent receives every decoded frame except pong. A refused subscription
+// goes to onError and is dropped from the set without closing the
+// connection. Run returns when ctx is cancelled, Close is called (nil), or a
+// fatal error escapes onError (return false to stop).
 func (s *RawJsonSession) Run(ctx context.Context, onEvent func(*Message) bool, onError func(error) bool) error {
 	if !s.runMu.TryLock() {
 		return &coinwerr.ValidationError{Message: "Run is already active"}
 	}
 	defer s.runMu.Unlock()
-	defer s.closeQuietly()
 	if onEvent == nil || onError == nil {
 		return &coinwerr.ValidationError{Message: "Run requires event and error callbacks"}
 	}
-reconnectLoop:
+	defer s.dropQuietly()
+	runCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	s.mu.Lock()
+	s.stopRun = func() { cancel(errSessionClosed) }
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.stopRun = nil
+		s.mu.Unlock()
+	}()
+	err := s.run(runCtx, onEvent, onError)
+	if errors.Is(context.Cause(runCtx), errSessionClosed) {
+		return nil
+	}
+	return err
+}
+
+func (s *RawJsonSession) run(ctx context.Context, onEvent func(*Message) bool, onError func(error) bool) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		s.mu.Lock()
-		connected := s.conn != nil && s.conn.active()
+		conn := s.conn
 		s.mu.Unlock()
-
-		if !connected {
+		if conn == nil || !conn.active() {
 			if err := s.Connect(ctx); err != nil {
 				if !onError(err) {
 					return err
@@ -465,55 +505,51 @@ reconnectLoop:
 				if err := s.reconnect.wait(ctx); err != nil {
 					return err
 				}
-				continue
 			}
-			s.reconnect.reset()
-			// resubscribe desired set
-			s.mu.Lock()
-			subs := make([]subscription, 0, len(s.subs))
-			for _, sub := range s.subs {
-				subs = append(subs, sub)
-			}
-			conn := s.conn
-			for _, sub := range subs {
-				if err := conn.WriteMessage(websocket.TextMessage, sub.frame); err != nil {
-					s.mu.Unlock()
-					s.closeQuietly()
-					if !onError(err) {
-						return err
-					}
-					if err := s.reconnect.wait(ctx); err != nil {
-						return err
-					}
-					continue reconnectLoop
-				}
-			}
-			s.mu.Unlock()
-		}
-		s.mu.Lock()
-		conn := s.conn
-		s.mu.Unlock()
-		if conn == nil {
 			continue
 		}
+		healthy := false
 		err := runIO(ctx, s.pingPeriod, s.Ping, func() (interface{}, error) {
 			msg, err := s.ReadMessage()
-			if msg == nil || msg.IsPong() {
+			if msg == nil {
 				return nil, err
 			}
-			if rejection := msg.AsError(); rejection != nil {
+			rejection := msg.AsError()
+			if rejection == nil && !healthy {
+				// Resetting on the first good frame rather than on dial keeps the
+				// backoff growing while every new connection is rejected.
+				healthy = true
+				s.reconnect.reset()
+			}
+			if msg.IsPong() {
+				return nil, nil
+			}
+			if rejection == nil {
+				return msg, nil
+			}
+			if !msg.IsSubscribeAck() {
 				return nil, rejection
 			}
-			return msg, err
+			// One subscription was refused; the connection and the other
+			// streams are fine, so the session keeps reading.
+			s.forgetRejected(msg)
+			if !onError(rejection) {
+				return nil, &stopError{err: rejection}
+			}
+			return nil, nil
 		}, func(msg interface{}) bool { return onEvent(msg.(*Message)) }, conn)
 		if err != nil {
+			var stop *stopError
+			if errors.As(err, &stop) {
+				return stop.err
+			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if !onError(err) {
 				return err
 			}
-			s.closeQuietly()
+			s.dropQuietly()
 			if err := s.reconnect.wait(ctx); err != nil {
 				return err
 			}
@@ -523,8 +559,44 @@ reconnectLoop:
 	}
 }
 
-// Close closes the underlying connection.
+// forgetRejected removes a refused subscription from the desired set so that
+// reconnects stop sending it. Acks echo the biz/type/pairCode/interval params.
+func (s *RawJsonSession) forgetRejected(m *Message) {
+	if m.Channel != "subscribe" {
+		return
+	}
+	params := map[string]interface{}{}
+	for _, k := range []string{"biz", "type", "pairCode", "interval"} {
+		switch v := m.Raw[k].(type) {
+		case string:
+			params[k] = v
+		case json.Number:
+			params[k] = v.String()
+		}
+	}
+	if len(params) == 0 {
+		return
+	}
+	s.mu.Lock()
+	delete(s.subs, subKey(params))
+	s.mu.Unlock()
+}
+
+// Close closes the connection and stops an active Run, which returns nil.
+// The desired subscriptions are kept for a later Connect or Run.
 func (s *RawJsonSession) Close() error {
+	s.mu.Lock()
+	stop := s.stopRun
+	s.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	return s.dropConn()
+}
+
+// dropConn closes the current connection without stopping Run, which then
+// reconnects and restores the desired subscriptions.
+func (s *RawJsonSession) dropConn() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.conn != nil {
@@ -536,7 +608,28 @@ func (s *RawJsonSession) Close() error {
 	return nil
 }
 
-func (s *RawJsonSession) closeQuietly() { _ = s.Close() }
+// dropConnIf drops c only if it is still the current connection.
+func (s *RawJsonSession) dropConnIf(c *sessionConn) {
+	s.mu.Lock()
+	if s.conn == c {
+		s.conn = nil
+		s.auth = false
+	}
+	s.mu.Unlock()
+	_ = c.Close()
+}
+
+func (s *RawJsonSession) dropQuietly() { _ = s.dropConn() }
+
+// errSessionClosed marks a Run stopped by Close rather than by its context.
+var errSessionClosed = errors.New("websocket session closed")
+
+// stopError carries an error onError already declined, so Run returns it
+// without asking onError again.
+type stopError struct{ err error }
+
+func (e *stopError) Error() string { return e.err.Error() }
+func (e *stopError) Unwrap() error { return e.err }
 
 func subKey(params map[string]interface{}) string {
 	raw, _ := json.Marshal(params)
@@ -578,6 +671,7 @@ type SocketIOSession struct {
 	mu        sync.Mutex
 	conn      *sessionConn
 	args      map[string]struct{}
+	stopRun   func()
 }
 
 // SocketIOOption customises a session.
@@ -702,7 +796,18 @@ func (s *SocketIOSession) Connect(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	s.conn = c
+	args := make([]string, 0, len(s.args))
+	for a := range s.args {
+		args = append(args, a)
+	}
 	s.mu.Unlock()
+	for _, a := range args {
+		frame, _ := sioEvent("subscribe", map[string]interface{}{"args": a})
+		if err := c.WriteMessage(websocket.TextMessage, frame); err != nil {
+			s.dropConnIf(c)
+			return &coinwerr.TransportError{Message: "resubscribe send failed", Err: err}
+		}
+	}
 	return nil
 }
 
@@ -710,54 +815,61 @@ func hasWSScheme(host string) bool {
 	return len(host) > 6 && (host[:6] == "wss://" || host[:5] == "ws://")
 }
 
-// Subscribe sends 42["subscribe",{"args":"…"}] and registers for resubscribe.
+// Subscribe adds args to the desired set and sends
+// 42["subscribe",{"args":"…"}] when connected. Like the raw session, the set
+// is restored on every connect, including subscriptions made while
+// disconnected or whose send failed.
 func (s *SocketIOSession) Subscribe(args string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.conn == nil {
-		return &coinwerr.TransportError{Message: "websocket is not connected"}
-	}
 	frame, err := sioEvent("subscribe", map[string]interface{}{"args": args})
 	if err != nil {
 		return err
 	}
-	if err := s.conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+	s.mu.Lock()
+	s.args[args] = struct{}{}
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
+		return nil
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
 		return &coinwerr.TransportError{Message: "subscribe send failed", Err: err}
 	}
-	s.args[args] = struct{}{}
 	return nil
 }
 
-// Unsubscribe sends 42["unsubscribe",{"args":"…"}].
+// Unsubscribe removes args from the desired set and sends
+// 42["unsubscribe",{"args":"…"}] when connected.
 func (s *SocketIOSession) Unsubscribe(args string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.conn == nil {
-		return &coinwerr.TransportError{Message: "websocket is not connected"}
-	}
 	frame, err := sioEvent("unsubscribe", map[string]interface{}{"args": args})
 	if err != nil {
 		return err
 	}
-	if err := s.conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+	s.mu.Lock()
+	delete(s.args, args)
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
+		return nil
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
 		return &coinwerr.TransportError{Message: "unsubscribe send failed", Err: err}
 	}
-	delete(s.args, args)
 	return nil
 }
 
 // Ping emits the documented keepalive event.
 func (s *SocketIOSession) Ping() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.conn == nil {
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
 		return &coinwerr.TransportError{Message: "websocket is not connected"}
 	}
 	frame, err := sioEvent("event", map[string]interface{}{"event": "ping"})
 	if err != nil {
 		return err
 	}
-	return s.conn.WriteMessage(websocket.TextMessage, frame)
+	return conn.WriteMessage(websocket.TextMessage, frame)
 }
 
 // ReadMessage returns the next Socket.IO event, or nil,nil for engine-level
@@ -838,26 +950,43 @@ func (s *SocketIOSession) handleSocketIO(conn Conn, payload []byte) (*SocketIOMe
 	}
 }
 
-// Run is the blocking loop with reconnect + resubscribe.
+// Run is the blocking loop with reconnect + resubscribe. Close stops it, and
+// it then returns nil.
 func (s *SocketIOSession) Run(ctx context.Context, onEvent func(*SocketIOMessage) bool, onError func(error) bool) error {
 	if !s.runMu.TryLock() {
 		return &coinwerr.ValidationError{Message: "Run is already active"}
 	}
 	defer s.runMu.Unlock()
-	defer s.closeQuietly()
 	if onEvent == nil || onError == nil {
 		return &coinwerr.ValidationError{Message: "Run requires event and error callbacks"}
 	}
-reconnectLoop:
+	defer s.dropQuietly()
+	runCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	s.mu.Lock()
+	s.stopRun = func() { cancel(errSessionClosed) }
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.stopRun = nil
+		s.mu.Unlock()
+	}()
+	err := s.run(runCtx, onEvent, onError)
+	if errors.Is(context.Cause(runCtx), errSessionClosed) {
+		return nil
+	}
+	return err
+}
+
+func (s *SocketIOSession) run(ctx context.Context, onEvent func(*SocketIOMessage) bool, onError func(error) bool) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		s.mu.Lock()
-		connected := s.conn != nil && s.conn.active()
+		conn := s.conn
 		s.mu.Unlock()
-
-		if !connected {
+		if conn == nil || !conn.active() {
 			if err := s.Connect(ctx); err != nil {
 				if !onError(err) {
 					return err
@@ -867,33 +996,8 @@ reconnectLoop:
 				}
 				continue
 			}
+			// The namespace CONNECT answer already proves the connection.
 			s.reconnect.reset()
-			s.mu.Lock()
-			args := make([]string, 0, len(s.args))
-			for a := range s.args {
-				args = append(args, a)
-			}
-			conn := s.conn
-			for _, a := range args {
-				frame, _ := sioEvent("subscribe", map[string]interface{}{"args": a})
-				if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
-					s.mu.Unlock()
-					s.closeQuietly()
-					if !onError(err) {
-						return err
-					}
-					if err := s.reconnect.wait(ctx); err != nil {
-						return err
-					}
-					continue reconnectLoop
-				}
-			}
-			s.mu.Unlock()
-		}
-		s.mu.Lock()
-		conn := s.conn
-		s.mu.Unlock()
-		if conn == nil {
 			continue
 		}
 		err := runIO(ctx, s.pingPeriod, s.Ping, func() (interface{}, error) {
@@ -910,7 +1014,7 @@ reconnectLoop:
 			if !onError(err) {
 				return err
 			}
-			s.closeQuietly()
+			s.dropQuietly()
 			if err := s.reconnect.wait(ctx); err != nil {
 				return err
 			}
@@ -920,8 +1024,20 @@ reconnectLoop:
 	}
 }
 
-// Close closes the connection.
+// Close closes the connection and stops an active Run, which returns nil.
+// The desired subscriptions are kept for a later Connect or Run.
 func (s *SocketIOSession) Close() error {
+	s.mu.Lock()
+	stop := s.stopRun
+	s.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	return s.dropConn()
+}
+
+// dropConn closes the current connection without stopping Run.
+func (s *SocketIOSession) dropConn() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.conn != nil {
@@ -932,7 +1048,17 @@ func (s *SocketIOSession) Close() error {
 	return nil
 }
 
-func (s *SocketIOSession) closeQuietly() { _ = s.Close() }
+// dropConnIf drops c only if it is still the current connection.
+func (s *SocketIOSession) dropConnIf(c *sessionConn) {
+	s.mu.Lock()
+	if s.conn == c {
+		s.conn = nil
+	}
+	s.mu.Unlock()
+	_ = c.Close()
+}
+
+func (s *SocketIOSession) dropQuietly() { _ = s.dropConn() }
 
 func sioEvent(event string, payload map[string]interface{}) ([]byte, error) {
 	arr, err := json.Marshal([]interface{}{event, payload})

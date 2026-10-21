@@ -81,7 +81,8 @@ func changeStream[T any](ctx context.Context, s *RawJsonSession, stream Stream[T
 	if stream.private && s.onConnect == nil && !unsubscribe {
 		return &coinwerr.ValidationError{Message: "private typed subscriptions require WithOnConnect to fetch the corresponding REST snapshot"}
 	}
-	stop := context.AfterFunc(ctx, s.closeQuietly)
+	// Cancelling interrupts a blocked send; Run reconnects and restores the set.
+	stop := context.AfterFunc(ctx, s.dropQuietly)
 	defer stop()
 	var err error
 	if unsubscribe {
@@ -110,7 +111,7 @@ func changeSocketIO[T any](ctx context.Context, s *SocketIOSession, stream Strea
 	if s == nil {
 		return &coinwerr.ValidationError{Message: "nil Socket.IO session"}
 	}
-	stop := context.AfterFunc(ctx, s.closeQuietly)
+	stop := context.AfterFunc(ctx, s.dropQuietly)
 	defer stop()
 	var err error
 	if unsubscribe {

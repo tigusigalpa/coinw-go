@@ -62,8 +62,11 @@ an error to review, not permission to silently accept arbitrary payloads.
 ## Snapshot and ordering policy
 
 Private streams do not promise an initial snapshot. Supply `WithOnConnect` to
-fetch the documented REST read for your selected subscription after login and
-before resubscription on every connection. A failing hook aborts that connection.
+fetch the documented REST read for your selected subscription on every
+connection. It runs after login and after the subscriptions are sent, before
+the first frame is read; events pushed meanwhile wait in the socket, so none
+fall between the snapshot and the stream, though some may already be reflected
+in it. A failing hook aborts that connection.
 Typed private subscriptions reject a missing hook. This makes snapshot selection
 explicit where the REST read requires caller-selected instruments or filters.
 The application chooses the scope and reconciles events using documented state

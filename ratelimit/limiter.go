@@ -25,45 +25,42 @@ type Limiter interface {
 	Acquire(ctx context.Context, endpoint endpoints.Definition, uid string) error
 }
 
-// bucket is a classic token bucket guarded by the parent mutex.
+// bucket is a sliding-window log guarded by the parent mutex: it grants at
+// most limit requests in any window. A token bucket with capacity N would
+// allow a burst of N plus N refilled tokens, about 2N, within one second.
 type bucket struct {
-	capacity float64
-	rate     float64 // tokens per second
-	tokens   float64
-	lastFill time.Time
+	limit  int
+	window time.Duration
+	grants []time.Time // the last limit grant times, a ring once full
+	oldest int
 }
 
-func newBucket(capacity, rate float64, now time.Time) *bucket {
-	return &bucket{capacity: capacity, rate: rate, tokens: capacity, lastFill: now}
+// newBucket allows rate requests per second, or one per 1/rate seconds when
+// rate is fractional or below one.
+func newBucket(rate float64) *bucket {
+	limit := int(math.Max(1, math.Floor(rate)))
+	window := time.Duration(math.Ceil(float64(limit) / rate * float64(time.Second)))
+	return &bucket{limit: limit, window: window, grants: make([]time.Time, 0, limit)}
 }
 
-// waitDuration returns how long until one token is available.
+// waitDuration returns how long until one more grant fits in the window.
 func (b *bucket) waitDuration(now time.Time) time.Duration {
-	b.refill(now)
-	if b.tokens >= 1.0 {
+	if len(b.grants) < b.limit {
 		return 0
 	}
-	missing := 1.0 - b.tokens
-	return time.Duration(math.Ceil(missing / b.rate * float64(time.Second)))
-}
-
-func (b *bucket) refill(now time.Time) {
-	elapsed := now.Sub(b.lastFill).Seconds()
-	if elapsed <= 0 {
-		return
+	if w := b.grants[b.oldest].Add(b.window).Sub(now); w > 0 {
+		return w
 	}
-	b.tokens += elapsed * b.rate
-	if b.tokens > b.capacity {
-		b.tokens = b.capacity
-	}
-	b.lastFill = now
+	return 0
 }
 
 func (b *bucket) commit(now time.Time) {
-	b.refill(now)
-	if b.tokens >= 1.0 {
-		b.tokens -= 1.0
+	if len(b.grants) < b.limit {
+		b.grants = append(b.grants, now)
+		return
 	}
+	b.grants[b.oldest] = now
+	b.oldest = (b.oldest + 1) % b.limit
 }
 
 // Clock abstracts time for deterministic tests.
@@ -138,7 +135,6 @@ func (l *InMemoryLimiter) Acquire(ctx context.Context, ep endpoints.Definition, 
 func (l *InMemoryLimiter) bucketsFor(ep endpoints.Definition, uid string) []*bucket {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	now := l.clock.Now()
 
 	type spec struct {
 		key string
@@ -179,7 +175,7 @@ func (l *InMemoryLimiter) bucketsFor(ep endpoints.Definition, uid string) []*buc
 	for _, s := range specs {
 		b, ok := l.buckets[s.key]
 		if !ok {
-			b = newBucket(math.Max(1, s.rps), s.rps, now)
+			b = newBucket(s.rps)
 			l.buckets[s.key] = b
 		}
 		out = append(out, b)

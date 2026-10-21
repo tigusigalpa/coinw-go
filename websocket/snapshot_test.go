@@ -13,6 +13,7 @@ import (
 
 func TestPrivateReconnectReloginsSnapshotsAndResubscribes(t *testing.T) {
 	var connections, snapshots, subscriptions atomic.Int32
+	subscribed := make(chan int32, 2)
 	url := wsServer(t, func(c *gorilla.Conn) {
 		n := connections.Add(1)
 		_, login, err := c.ReadMessage()
@@ -31,9 +32,7 @@ func TestPrivateReconnectReloginsSnapshotsAndResubscribes(t *testing.T) {
 			return
 		}
 		subscriptions.Add(1)
-		if snapshots.Load() < n {
-			t.Error("subscription restored before the required snapshot hook")
-		}
+		subscribed <- n
 		if n == 1 {
 			return
 		}
@@ -48,6 +47,16 @@ func TestPrivateReconnectReloginsSnapshotsAndResubscribes(t *testing.T) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		// The snapshot must start only after this connection's subscription
+		// was sent, so no event can fall between the two.
+		select {
+		case n := <-subscribed:
+			if n != snapshots.Load()+1 {
+				t.Errorf("snapshot for connection %d saw subscription of connection %d", snapshots.Load()+1, n)
+			}
+		case <-time.After(time.Second):
+			t.Error("snapshot hook ran before the subscription was sent")
+		}
 		snapshots.Add(1)
 		return nil
 	}), WithReconnectPolicy(&ReconnectPolicy{BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}))
@@ -59,7 +68,13 @@ func TestPrivateReconnectReloginsSnapshotsAndResubscribes(t *testing.T) {
 	if err := SubscribeStream(ctx, s, FuturesAssets()); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Run(ctx, func(*Message) bool { return false }, func(error) bool { return true }); err != nil {
+	onEvent := func(*Message) bool {
+		if snapshots.Load() != connections.Load() {
+			t.Error("event delivered before its connection's snapshot")
+		}
+		return false
+	}
+	if err := s.Run(ctx, onEvent, func(error) bool { return true }); err != nil {
 		t.Fatal(err)
 	}
 	if connections.Load() != 2 || snapshots.Load() != 2 || subscriptions.Load() != 2 {

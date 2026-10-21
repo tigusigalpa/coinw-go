@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -66,7 +67,7 @@ func TestFuturesGlobalBudgetWithoutUID(t *testing.T) {
 
 func TestBucketWaitAndRefill(t *testing.T) {
 	c := &fakeClock{now: time.Unix(0, 0)}
-	b := newBucket(2, 1, c.Now())
+	b := newBucket(2)
 	if w := b.waitDuration(c.Now()); w != 0 {
 		t.Fatalf("expected no wait, got %v", w)
 	}
@@ -78,6 +79,38 @@ func TestBucketWaitAndRefill(t *testing.T) {
 	c.Advance(time.Second)
 	if w := b.waitDuration(c.Now()); w != 0 {
 		t.Fatalf("expected refilled bucket, got wait %v", w)
+	}
+}
+
+func TestBucketNeverExceedsRateWithinOneSecond(t *testing.T) {
+	for _, rate := range []float64{100, 30, 5, 1.5} {
+		c := &fakeClock{now: time.Unix(0, 0)}
+		b := newBucket(rate)
+		// A greedy caller takes every grant as soon as it is offered.
+		var grants []time.Time
+		for c.Now().Before(time.Unix(3, 0)) {
+			if w := b.waitDuration(c.Now()); w > 0 {
+				c.Advance(w)
+				continue
+			}
+			b.commit(c.Now())
+			grants = append(grants, c.Now())
+		}
+		limit := int(math.Ceil(rate))
+		for i := range grants {
+			inWindow := 0
+			for _, g := range grants[i:] {
+				if g.Sub(grants[i]) < time.Second {
+					inWindow++
+				}
+			}
+			if inWindow > limit {
+				t.Fatalf("rate %v: %d grants within one second from %v", rate, inWindow, grants[i].Sub(time.Unix(0, 0)))
+			}
+		}
+		if len(grants) < int(3*rate*0.9) {
+			t.Fatalf("rate %v: only %d grants in 3s", rate, len(grants))
+		}
 	}
 }
 

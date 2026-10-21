@@ -51,6 +51,20 @@
 - README WebSocket variable shadowing and explicit implementation limitations.
 - Unfiltered Spot cancellation is gated instead of assuming an all-market scope;
   batch SL/TP now requires stopFrom and permits the documented optional instrument.
+- A refused WebSocket subscription no longer closes the connection: it goes to
+  the error callback, the other streams keep running, and the refused stream is
+  dropped from the restore set. Reconnect backoff resets only after a healthy
+  frame, so connections that are always rejected now reach `MaxAttempts`.
+- `Close` now stops an active `Run`, which returns nil, instead of letting it
+  reconnect.
+- The rate limiter uses a sliding window, so "N requests/s" can no longer
+  burst to about 2N within one second.
+- `WithOnConnect` now runs after the subscriptions are sent and before the
+  first frame is read, so no event falls between the snapshot and the stream.
+- `Subscribe` and `Unsubscribe` change the desired set while disconnected, and
+  `Connect` restores it. A failed send keeps the subscription registered.
+- Fixed a nil-pointer panic when the connection was dropped between `Connect`
+  and the restore of subscriptions.
 
 ### Added
 - Initial implementation of the CoinW Go SDK (`github.com/tigusigalpa/coinw-go`,
